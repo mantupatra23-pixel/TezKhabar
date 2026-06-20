@@ -3,17 +3,17 @@ import time
 import feedparser
 import requests
 from bs4 import BeautifulSoup
-from openai import OpenAI
+from groq import Groq
 
-# Environment Variables (Render par configure karenge)
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-WP_URL = os.getenv("WP_URL")  # Example: https://yourwebsite.com/wp-json/wp/v2/posts
-WP_USER = os.getenv("WP_USER")
-WP_PASSWORD = os.getenv("WP_PASSWORD")  # 16-digit application password
+# Render Environment Groups se variables read ho rahe hain
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+BLOG_ID = os.getenv("BLOG_ID")
+BLOGGER_API_KEY = os.getenv("BLOGGER_API_KEY")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+# Groq Client Initialization
+groq_client = Groq(api_key=GROQ_API_KEY)
 
-# Sentinal list duplicate posts se bachne ke liye
+# Duplicate check ke liye set
 processed_urls = set()
 
 def scrape_article_text(url):
@@ -22,87 +22,97 @@ def scrape_article_text(url):
         r = requests.get(url, headers=headers, timeout=10)
         soup = BeautifulSoup(r.content, 'html.parser')
         paragraphs = soup.find_all('p')
-        # Pehle 8 paragraphs extract kar rahe hain full body context ke liye
-        text = " ".join([p.get_text() for p in paragraphs[:8]])
+        # Full content ke liye paragraphs collect kar rahe hain
+        text = " ".join([p.get_text() for p in paragraphs[:10]])
         return text if len(text) > 200 else None
     except Exception as e:
-        print(f"Error scraping {url}: {e}")
+        print(f"❌ Scraping fail: {url} -> {e}")
         return None
 
-def rewrite_to_hinglish(raw_text):
+def rewrite_to_hinglish_groq(raw_text):
     prompt = f"""
-    You are a viral Indian News Editor. Take this raw news and rewrite it into a highly engaging, click-worthy blog post in natural Hinglish (Roman script).
+    You are a viral Indian News Editor for a Gen-Z and Millennial audience. 
+    Rewrite the following raw news text into a highly engaging, click-worthy news update in casual Hinglish (natural Roman script mix of Hindi and English).
     
-    Rules:
-    1. Tone: Energetic, spicy, conversational (Use words like 'Bawaal', 'Dhamaka', 'Tana-tani' naturally).
-    2. Format: Clear subheadings (##), bold keywords, and short paragraphs.
-    3. Output structure:
-       [TITLE] Put a viral clickbait title here
-       [BODY] Put the full blog post content here
+    CRITICAL RULES:
+    1. TONE: Energetic and spicy. Use slangs like 'Bawaal', 'Dhamaka', 'Ude hosh', 'Tana-tani' naturally.
+    2. FORMAT: Keep it highly scannable. Use proper headings (##) and bold keywords. 
+    3. OUTPUT STRUCTURE: Strictly provide output in this exact format:
+       [TITLE] Put the viral title here
+       [BODY] Put the full rewritten news content here
     
     Source Text: {raw_text}
     """
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
+        chat_completion = groq_client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.7
+            model="llama-3.3-70b-versatile",
+            temperature=0.7,
         )
-        return response.choices[0].message.content
+        return chat_completion.choices[0].message.content
     except Exception as e:
-        print(f"OpenAI Error: {e}")
+        print(f"❌ Groq API Error: {e}")
         return None
 
-def post_to_wordpress(ai_output):
-    if not ai_output or "[TITLE]" not in ai_output:
+def post_to_blogger(ai_output):
+    if not ai_output or "[TITLE]" not in ai_output or "[BODY]" not in ai_output:
+        print("❌ AI output format is incomplete.")
         return
     
     try:
-        # Title aur Body ko split karna
+        # Title aur Body separation logic
         parts = ai_output.split("[BODY]")
         title = parts[0].replace("[TITLE]", "").strip()
         body = parts[1].strip()
         
-        # Markdown to simple clean format processing
+        # Newlines ko Blogger HTML compatibility ke liye convert kar rahe hain
         formatted_body = body.replace("\n", "<br>")
         
+        # Blogger API Endpoint URL
+        url = f"https://www.googleapis.com/blogger/v3/blogs/{BLOG_ID}/posts/?key={BLOGGER_API_KEY}"
+        
         payload = {
+            "kind": "blogger#post",
             "title": title,
-            "content": formatted_body,
-            "status": "publish"
+            "content": formatted_body
         }
         
-        res = requests.post(WP_URL, json=payload, auth=(WP_USER, WP_PASSWORD))
-        if res.status_code == 201:
-            print(f"🎉 Successfully Published: {title}")
+        res = requests.post(url, json=payload, timeout=15)
+        if res.status_code == 200:
+            print(f"🎉 Blogger post published successfully: {title}")
         else:
-            print(f"❌ WP Error: {res.text}")
+            print(f"❌ Blogger REST API Error: {res.text}")
     except Exception as e:
-        print(f"Posting system failed: {e}")
+        print(f"❌ Posting runtime error: {e}")
 
-def job():
-    print("🔄 Checking for new breaking news...")
-    # Politics + Bollywood RSS Feeds
+def start_engine():
+    print("🔄 TezKhabar engine checking for new stories...")
+    
+    # Politics + Bollywood Live Streams Feeds
     feeds = [
         "https://news.google.com/rss/search?q=politics+India&hl=en-IN&gl=IN&ceid=IN:en",
         "https://news.google.com/rss/search?q=Bollywood&hl=en-IN&gl=IN&ceid=IN:en"
     ]
     
-    for url in feeds:
-        feed = feedparser.parse(url)
-        for entry in feed.entries[:2]: # Top 2 articles per feed
+    for feed_url in feeds:
+        feed = feedparser.parse(feed_url)
+        for entry in feed.entries[:2]: # Top 2 breaking topics filter
             if entry.link not in processed_urls:
                 processed_urls.add(entry.link)
-                print(f"Found new story: {entry.title}")
+                print(f"📰 Found target story: {entry.title}")
                 
-                raw_content = scrape_article_text(entry.link)
-                if raw_content:
-                    ai_content = rewrite_to_hinglish(raw_content)
-                    post_to_wordpress(ai_content)
-                    time.sleep(5) # Rate limiting safe buffer
+                raw_text = scrape_article_text(entry.link)
+                if raw_text:
+                    ai_content = rewrite_to_hinglish_groq(raw_text)
+                    post_to_blogger(ai_content)
+                    time.sleep(5) # API Rate Limit protection delay
 
 if __name__ == "__main__":
-    # Render loop handler (Har 30 mins me check karega)
+    # Infinite loop handler (Runs every 30 minutes seamlessly)
     while True:
-        job()
+        try:
+            start_engine()
+        except Exception as global_error:
+            print(f"⚠️ Loop Warning: {global_error}")
+        
         time.sleep(1800)
