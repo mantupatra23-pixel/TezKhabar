@@ -17,10 +17,10 @@ MONGO_URI = os.getenv("MONGO_URI")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "https://tezkhabar.onrender.com")
 
-app = FastAPI(title="TezKhabar Force Engine v4.1")
+app = FastAPI(title="TezKhabar Force Engine v4.2")
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-# Force connection check
+# Database strict initialization
 try:
     db_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
     db = db_client["tezkhabar_db"]
@@ -128,34 +128,47 @@ def save_to_mongodb(ai_output, image_url, source_url, fallback_title="Breaking N
             "created_at": time.time()
         }
         
-        # Force Insert Execution
         insert_res = posts_collection.insert_one(payload)
-        print(f"🚀 FORCED INSERT SUCCESSFUL! ID: {insert_res.inserted_id} | Title: {title}")
+        print(f"🚀 INSERT SUCCESSFUL! ID: {insert_res.inserted_id} | Title: {title}")
     except Exception as e:
-        print(f"❌ MongoDB Force Insertion Crash: {e}")
+        print(f"❌ MongoDB Insertion Crash: {e}")
 
-def news_scrapper_loop():
-    print("🔄 TezKhabar Core Engine v4.1 Active...")
+def run_core_scraping_engine():
+    """Unified engine to process feeds"""
     feeds = [
         "https://news.google.com/rss/search?q=politics+India&hl=en-IN&gl=IN&ceid=IN:en",
         "https://news.google.com/rss/search?q=Bollywood&hl=en-IN&gl=IN&ceid=IN:en"
     ]
-    
+    scraped_count = 0
+    for feed_url in feeds:
+        feed = feedparser.parse(feed_url)
+        for entry in feed.entries[:3]:
+            if not posts_collection.find_one({"source_url": entry.link}):
+                print(f"📰 Scrape Target: {entry.title}")
+                article_data = scrape_article_data(entry.link)
+                
+                # Check if text scraping failed, apply robust dynamic fallback
+                text_content = article_data["text"] if article_data["text"] else entry.title + " full updates coming soon."
+                
+                ai_content = rewrite_to_hinglish_groq(text_content)
+                save_to_mongodb(ai_content, article_data["image"], entry.link, fallback_title=entry.title)
+                scraped_count += 1
+                time.sleep(3)
+    return scraped_count
+
+def news_scrapper_loop():
+    print("🔄 TezKhabar Core Engine Background Scraper Active...")
     while True:
         try:
-            for feed_url in feeds:
-                feed = feedparser.parse(feed_url)
-                for entry in feed.entries[:2]:
-                    if not posts_collection.find_one({"source_url": entry.link}):
-                        print(f"📰 Scrape Target: {entry.title}")
-                        article_data = scrape_article_data(entry.link)
-                        if article_data["text"]:
-                            ai_content = rewrite_to_hinglish_groq(article_data["text"])
-                            save_to_mongodb(ai_content, article_data["image"], entry.link, fallback_title=entry.title)
-                            time.sleep(5)
+            run_core_scraping_engine()
         except Exception as e:
             print(f"⚠️ Loop Error: {e}")
-        time.sleep(1800)
+        
+        # ⏳ 10 Minutes Cooling Timer Setup (60 seconds * 10)
+        print("💤 Scraper going to sleep for 10 minutes...")
+        time.sleep(600)
+
+# --- APIS ENDPOINTS ---
 
 @app.get("/")
 def home():
@@ -168,6 +181,33 @@ def get_all_news(category: str = None, limit: int = 20):
         query["category"] = category
     cursor = posts_collection.find(query, {"_id": 0}).sort("created_at", -1).limit(limit)
     return list(cursor)
+
+@app.get("/api/scrape-now")
+def force_scrape():
+    """Manual trigger link endpoint"""
+    try:
+        count = run_core_scraping_engine()
+        return {"status": "Success", "items_processed": count}
+    except Exception as e:
+        return {"status": "Error", "message": str(e)}
+
+@app.get("/api/sitemap.xml")
+def get_dynamic_sitemap():
+    urlset = ET.Element("urlset", xmlns="http://www.sitemaps.org/schemas/sitemap/0.9")
+    home_url = ET.SubElement(urlset, "url")
+    ET.SubElement(home_url, "loc").text = RENDER_EXTERNAL_URL
+    ET.SubElement(home_url, "priority").text = "1.0"
+    
+    cursor = posts_collection.find({}, {"slug": 1, "created_at": 1}).sort("created_at", -1).limit(500)
+    for post in cursor:
+        if "slug" in post:
+            url_node = ET.SubElement(urlset, "url")
+            ET.SubElement(url_node, "loc").text = f"{RENDER_EXTERNAL_URL}/news/{post['slug']}"
+            ET.SubElement(url_node, "priority").text = "0.8"
+            
+    xml_str = ET.tostring(urlset, encoding='utf-8')
+    parsed_xml = minidom.parseString(xml_str)
+    return Response(content=parsed_xml.toprettyxml(indent="  "), media_type="application/xml")
 
 if __name__ == "__main__":
     scraper_thread = threading.Thread(target=news_scrapper_loop, daemon=True)
