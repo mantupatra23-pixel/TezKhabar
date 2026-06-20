@@ -1,19 +1,23 @@
 import os
 import time
 import threading
+import xml.etree.ElementTree as ET
+from xml.dom import minidom
 import feedparser
 import requests
 from bs4 import BeautifulSoup
 from groq import Groq
 from pymongo import MongoClient
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 MONGO_URI = os.getenv("MONGO_URI")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "https://tezkhabar.onrender.com")
 
-app = FastAPI(title="TezKhabar API Engine")
+app = FastAPI(title="TezKhabar Enterprise Engine v4.0")
 groq_client = Groq(api_key=GROQ_API_KEY)
 
 db_client = MongoClient(MONGO_URI)
@@ -51,28 +55,35 @@ def scrape_article_data(url):
         print(f"❌ Scraping fail: {url} -> {e}")
         return {"text": None, "image": None}
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+def call_groq_api(prompt):
+    """Advanced robust handling for API Rate limits & server timeouts"""
+    chat_completion = groq_client.chat.completions.create(
+        messages=[{"role": "user", "content": prompt}],
+        model="llama-3.3-70b-versatile",
+        temperature=0.7,
+    )
+    return chat_completion.choices[0].message.content
+
 def rewrite_to_hinglish_groq(raw_text):
     prompt = f"""
     You are a viral Indian News Editor. Rewrite the following news into highly engaging, viral Hinglish (Roman script mix of Hindi and English).
     
     CRITICAL RULES:
-    1. TONE: Energetic, youth-centric, spicy.
-    2. OUTPUT STRUCTURE: Strictly output in this exact schema format:
+    1. TONE: Energetic, youth-centric, spicy, and extremely catchy.
+    2. SENTIMENT BADGE: Identify the structural tone of the news and choose exactly one badge: [Breaking 🚨], [Spicy 🔥], [Alert ⚠️], or [Trending 🚀].
+    3. OUTPUT STRUCTURE: Strictly output in this exact schema format:
        [TITLE] Put the viral title here
        [TAG] Single category tag (Politics, Bollywood, Tech, Sports, Crypto)
+       [BADGE] The chosen sentiment badge here
        [BODY] Put the full news body here
     
     Source Text: {raw_text}
     """
     try:
-        chat_completion = groq_client.chat.completions.create(
-            messages=[{"role": "user", "content": prompt}],
-            model="llama-3.3-70b-versatile",
-            temperature=0.7,
-        )
-        return chat_completion.choices[0].message.content
+        return call_groq_api(prompt)
     except Exception as e:
-        print(f"❌ Groq API Server Error: {e}")
+        print(f"❌ Groq API Ultimate Failure after retries: {e}")
         return None
 
 def save_to_mongodb(ai_output, image_url, source_url):
@@ -83,55 +94,66 @@ def save_to_mongodb(ai_output, image_url, source_url):
         parts_body = ai_output.split("[BODY]")
         body_content = parts_body[1].strip()
         
-        parts_title_tag = parts_body[0].split("[TAG]")
+        parts_title_segment = parts_body[0].split("[BADGE]")
+        badge = parts_title_segment[1].strip() if len(parts_title_segment) > 1 else "[Breaking 🚨]"
+        
+        parts_title_tag = parts_title_segment[0].split("[TAG]")
         title = parts_title_tag[0].replace("[TITLE]", "").strip()
         tag = parts_title_tag[1].strip() if len(parts_title_tag) > 1 else "General"
         
         if posts_collection.find_one({"source_url": source_url}):
-            print(f"⏭️ News already exists in Database: {title}")
             return
+
+        # URL slug clean transformation for dynamic Frontend Routing
+        slug = title.lower().replace(" ", "-").replace("?", "").replace("!", "").replace("'", "")
+        slug = "".join([c for c in slug if c.isalnum() or c == '-'])[:60]
 
         payload = {
             "title": title,
+            "slug": slug,
             "content": body_content,
             "category": tag,
+            "badge": badge,
             "image_url": image_url,
             "source_url": source_url,
             "created_at": time.time()
         }
         
         posts_collection.insert_one(payload)
-        print(f"🎉 Saved to MongoDB: {title} | Tag: [{tag}]")
+        print(f"🎉 Saved to DB with Badge: {title} | {badge} | [{tag}]")
     except Exception as e:
-        print(f"❌ MongoDB Insert Error: {e}")
+        print(f"❌ MongoDB Custom Parsing Error: {e}")
 
 def news_scrapper_loop():
-    print("🔄 TezKhabar Core Engine v3.0 Background Scraper Triggered...")
+    print("🔄 TezKhabar Core Engine v4.0 Heavy-Duty Scraper Live...")
     feeds = [
         "https://news.google.com/rss/search?q=politics+India&hl=en-IN&gl=IN&ceid=IN:en",
         "https://news.google.com/rss/search?q=Bollywood&hl=en-IN&gl=IN&ceid=IN:en",
-        "https://news.google.com/rss/search?q=Crypto+India&hl=en-IN&gl=IN&ceid=IN:en"
+        "https://news.google.com/rss/search?q=Crypto+India&hl=en-IN&gl=IN&ceid=IN:en",
+        "https://news.google.com/rss/search?q=Tech+India&hl=en-IN&gl=IN&ceid=IN:en"
     ]
     
     while True:
         try:
             for feed_url in feeds:
                 feed = feedparser.parse(feed_url)
-                for entry in feed.entries[:2]:
+                for entry in feed.entries[:3]: # Target expanded to top 3 articles per feed
                     if not posts_collection.find_one({"source_url": entry.link}):
-                        print(f"📰 Scraping New Item: {entry.title}")
+                        print(f"📰 Heavy Scrape Target: {entry.title}")
                         article_data = scrape_article_data(entry.link)
                         if article_data["text"]:
                             ai_content = rewrite_to_hinglish_groq(article_data["text"])
                             save_to_mongodb(ai_content, article_data["image"], entry.link)
                             time.sleep(5)
         except Exception as e:
-            print(f"⚠️ Scraper Loop Warning: {e}")
+            print(f"⚠️ Master Scrapper Loop Interruption: {e}")
         time.sleep(1800)
+
+# --- ADVANCED PRODUCTION APIS FOR HIGH-SPEED FRONTEND ---
 
 @app.get("/")
 def home():
-    return {"status": "TezKhabar Backend Server Running Successfully"}
+    return {"status": "TezKhabar Enterprise Backend Server Running Successfully"}
 
 @app.get("/api/news")
 def get_all_news(category: str = None, limit: int = 20):
@@ -140,6 +162,30 @@ def get_all_news(category: str = None, limit: int = 20):
         query["category"] = category
     cursor = posts_collection.find(query, {"_id": 0}).sort("created_at", -1).limit(limit)
     return list(cursor)
+
+@app.get("/api/sitemap.xml")
+def get_dynamic_sitemap():
+    """Live XML Generation endpoint for Instant Google Webmaster Indexing"""
+    urlset = ET.Element("urlset", xmlns="http://www.sitemaps.org/schemas/sitemap/0.9")
+    
+    # Homepage allocation
+    home_url = ET.SubElement(urlset, "url")
+    ET.SubElement(home_url, "loc").text = RENDER_EXTERNAL_URL
+    ET.SubElement(home_url, "priority").text = "1.0"
+    
+    # Read articles list to populate dynamic search map paths
+    cursor = posts_collection.find({}, {"slug": 1, "created_at": 1}).sort("created_at", -1).limit(500)
+    for post in cursor:
+        if "slug" in post:
+            url_node = ET.SubElement(urlset, "url")
+            ET.SubElement(url_node, "loc").text = f"{RENDER_EXTERNAL_URL}/news/{post['slug']}"
+            ET.SubElement(url_node, "priority").text = "0.8"
+            
+    xml_str = ET.tostring(urlset, encoding='utf-8')
+    parsed_xml = minidom.parseString(xml_str)
+    pretty_xml = parsed_xml.toprettyxml(indent="  ")
+    
+    return Response(content=pretty_xml, media_type="application/xml")
 
 if __name__ == "__main__":
     scraper_thread = threading.Thread(target=news_scrapper_loop, daemon=True)
