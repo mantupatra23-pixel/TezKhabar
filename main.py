@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import threading
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
@@ -12,15 +13,18 @@ from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from tenacity import retry, stop_after_attempt, wait_exponential
+from google.oauth2 import service_account
+from google.auth.transport.requests import AuthorizedSession
 
 MONGO_URI = os.getenv("MONGO_URI")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON")  # Service Account JSON String
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "https://tezkhabar.onrender.com")
 
-app = FastAPI(title="TezKhabar Force Engine v4.2")
+app = FastAPI(title="TezKhabar Ultimate Master Engine v5.0")
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-# Database strict initialization
+# --- DATABASE CONNECTION MONITOR ---
 try:
     db_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
     db = db_client["tezkhabar_db"]
@@ -38,6 +42,37 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- INSTANT GOOGLE INDEXING ENGINE ---
+def push_to_google_instant_index(target_url):
+    """Fires a high-priority notify alert directly to Google Bots to index pages in minutes"""
+    try:
+        if not GOOGLE_CREDS_JSON:
+            print("⚠️ Google Indexing Alert: GOOGLE_CREDS_JSON variable missing. Skipping ping.")
+            return
+            
+        creds_info = json.loads(GOOGLE_CREDS_JSON)
+        scoped_creds = service_account.Credentials.from_service_account_info(
+            creds_info, 
+            scopes=["https://www.googleapis.com/auth/indexing"]
+        )
+        
+        authed_session = AuthorizedSession(scoped_creds)
+        endpoint = "https://indexing.googleapis.com/v3/urlNotifications:publish"
+        
+        payload = {
+            "url": target_url,
+            "type": "URL_UPDATED"
+        }
+        
+        response = authed_session.post(endpoint, json=payload, timeout=10)
+        if response.status_code == 200:
+            print(f"🔥 GOOGLE CRAWLER PINGED SUCCESSFULLY! Target URL is now Live-Queued: {target_url}")
+        else:
+            print(f"❌ Indexing API Refusal: {response.status_code} -> {response.text}")
+    except Exception as e:
+        print(f"❌ Webmaster Authorization Crash: {e}")
+
+# --- CORE PARSING & CONTENT GENERATION SYSTEM ---
 def scrape_article_data(url):
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
@@ -75,11 +110,11 @@ def rewrite_to_hinglish_groq(raw_text):
     You are a viral Indian News Editor. Rewrite the following news into highly engaging, viral Hinglish (Roman script mix of Hindi and English).
     
     CRITICAL RULES:
-    1. TONE: Energetic, youth-centric, spicy.
+    1. TONE: Energetic, youth-centric, spicy, and extremely catchy.
     2. OUTPUT STRUCTURE: Strictly output in this exact schema format:
        [TITLE] Put the viral title here
        [TAG] Single category tag (Politics, Bollywood, Tech, Sports, Crypto)
-       [BADGE] [Breaking 🚨] or [Spicy 🔥] or [Alert ⚠️]
+       [BADGE] [Breaking 🚨] or [Spicy 🔥] or [Alert ⚠️] or [Trending 🚀]
        [BODY] Put the full news body here
     
     Source Text: {raw_text}
@@ -87,7 +122,7 @@ def rewrite_to_hinglish_groq(raw_text):
     try:
         return call_groq_api(prompt)
     except Exception as e:
-        print(f"❌ Groq API Failure: {e}")
+        print(f"❌ Groq System Error: {e}")
         return None
 
 def save_to_mongodb(ai_output, image_url, source_url, fallback_title="Breaking News"):
@@ -111,7 +146,7 @@ def save_to_mongodb(ai_output, image_url, source_url, fallback_title="Breaking N
                 tag = parts_title_tag[1].strip()
 
         if posts_collection.find_one({"source_url": source_url}):
-            print(f"⏭️ Already in DB: {title}")
+            print(f"箱 Already exists in DB: {title}")
             return
 
         slug = title.lower().replace(" ", "-").replace("?", "").replace("!", "").replace("'", "")
@@ -129,27 +164,30 @@ def save_to_mongodb(ai_output, image_url, source_url, fallback_title="Breaking N
         }
         
         insert_res = posts_collection.insert_one(payload)
+        generated_url = f"{RENDER_EXTERNAL_URL}/news/{slug}"
         print(f"🚀 INSERT SUCCESSFUL! ID: {insert_res.inserted_id} | Title: {title}")
+        
+        # Trigger Instant Indexing Worker Immediately after successful MongoDB Write
+        push_to_google_instant_index(generated_url)
+        
     except Exception as e:
-        print(f"❌ MongoDB Insertion Crash: {e}")
+        print(f"❌ MongoDB Custom Insertion Crash: {e}")
 
 def run_core_scraping_engine():
-    """Unified engine to process feeds"""
     feeds = [
         "https://news.google.com/rss/search?q=politics+India&hl=en-IN&gl=IN&ceid=IN:en",
-        "https://news.google.com/rss/search?q=Bollywood&hl=en-IN&gl=IN&ceid=IN:en"
+        "https://news.google.com/rss/search?q=Bollywood&hl=en-IN&gl=IN&ceid=IN:en",
+        "https://news.google.com/rss/search?q=Tech+India&hl=en-IN&gl=IN&ceid=IN:en"
     ]
     scraped_count = 0
     for feed_url in feeds:
         feed = feedparser.parse(feed_url)
         for entry in feed.entries[:3]:
             if not posts_collection.find_one({"source_url": entry.link}):
-                print(f"📰 Scrape Target: {entry.title}")
+                print(f"📰 Targeting Fresh Post: {entry.title}")
                 article_data = scrape_article_data(entry.link)
                 
-                # Check if text scraping failed, apply robust dynamic fallback
                 text_content = article_data["text"] if article_data["text"] else entry.title + " full updates coming soon."
-                
                 ai_content = rewrite_to_hinglish_groq(text_content)
                 save_to_mongodb(ai_content, article_data["image"], entry.link, fallback_title=entry.title)
                 scraped_count += 1
@@ -157,22 +195,21 @@ def run_core_scraping_engine():
     return scraped_count
 
 def news_scrapper_loop():
-    print("🔄 TezKhabar Core Engine Background Scraper Active...")
+    print("🔄 TezKhabar Core Engine Background Scraper Loop Online...")
     while True:
         try:
             run_core_scraping_engine()
         except Exception as e:
-            print(f"⚠️ Loop Error: {e}")
+            print(f"⚠️ Master Loop Exception: {e}")
         
-        # ⏳ 10 Minutes Cooling Timer Setup (60 seconds * 10)
-        print("💤 Scraper going to sleep for 10 minutes...")
-        time.sleep(600)
+        print("💤 Scraper cooling down. Going to sleep for 10 minutes...")
+        time.sleep(600)  # 60 seconds * 10 minutes
 
-# --- APIS ENDPOINTS ---
+# --- PRODUCTION API ENDPOINTS FOR FRONTEND ---
 
 @app.get("/")
 def home():
-    return {"status": "TezKhabar Backend Server Running Successfully"}
+    return {"status": "TezKhabar Master Core Engine v5.0 Live & Operational"}
 
 @app.get("/api/news")
 def get_all_news(category: str = None, limit: int = 20):
@@ -184,7 +221,7 @@ def get_all_news(category: str = None, limit: int = 20):
 
 @app.get("/api/scrape-now")
 def force_scrape():
-    """Manual trigger link endpoint"""
+    """Bypasses cooling timer. Instantly forces an extraction and indexing push query"""
     try:
         count = run_core_scraping_engine()
         return {"status": "Success", "items_processed": count}
