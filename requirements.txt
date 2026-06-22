@@ -10,3 +10,4 @@ beautifulsoup4==4.12.3
 python-slugify==8.0.4
 feedparser==6.0.11
 pyjwt==2.8.0
+groq==0.9.0
