@@ -1,4 +1,5 @@
 import os
+import sys
 import threading
 import logging
 from typing import Optional
@@ -6,6 +7,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import xml.sax.saxutils
 
+import uvicorn
 from fastapi import FastAPI, HTTPException, Header, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response as PlainResponse
@@ -31,16 +33,17 @@ logger = logging.getLogger("tezkhabar.main")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
     logger.info("[Startup] Initializing TezKhabar Backend V6...")
-    init_db()
+    try:
+        init_db()
+    except Exception as e:
+        logger.error(f"[Startup DB Error]: {e}")
     
     # Start background scheduler thread safely
     scraper_thread = threading.Thread(target=background_scraper_loop, daemon=True)
     scraper_thread.start()
     logger.info("[Startup] Background news ingestion worker initialized.")
     yield
-    # Shutdown
     logger.info("[Shutdown] Cleaning up TezKhabar services...")
 
 app = FastAPI(
@@ -118,12 +121,15 @@ def get_news_list(
     if category:
         query["category"] = category.lower()
 
-    total = news_collection.count_documents(query)
-    skip = (page - 1) * limit
-    cursor = news_collection.find(query).sort("published_at", -1).skip(skip).limit(limit)
-
-    items = [ArticleDocument(**clean_doc(d)) for d in cursor]
-    has_next = (skip + limit) < total
+    try:
+        total = news_collection.count_documents(query)
+        skip = (page - 1) * limit
+        cursor = news_collection.find(query).sort("published_at", -1).skip(skip).limit(limit)
+        items = [ArticleDocument(**clean_doc(d)) for d in cursor]
+        has_next = (skip + limit) < total
+    except Exception as e:
+        logger.error(f"[News List Error]: {e}")
+        return NewsListResponse(items=[], pagination=PaginationMetadata(page=page, limit=limit, total=0, has_next=False))
 
     return NewsListResponse(
         items=items,
@@ -135,10 +141,13 @@ def get_article_by_slug(slug: str):
     if news_collection is None:
         raise HTTPException(status_code=503, detail="Database unavailable")
 
-    doc = news_collection.find_one({"slug": slug, "content_status": "published"})
-    if not doc:
-        # Fallback check by ID
-        doc = news_collection.find_one({"_id": slug})
+    try:
+        doc = news_collection.find_one({"slug": slug, "content_status": "published"})
+        if not doc:
+            doc = news_collection.find_one({"_id": slug})
+    except Exception as e:
+        logger.error(f"[Article By Slug Error]: {e}")
+        raise HTTPException(status_code=500, detail="Database query error")
 
     if not doc:
         raise HTTPException(status_code=404, detail="Article not found")
@@ -154,9 +163,13 @@ def get_trending_news(limit: int = Query(10, ge=1, le=30)):
     if news_collection is None:
         return NewsListResponse(items=[], pagination=PaginationMetadata(page=1, limit=limit, total=0, has_next=False))
 
-    query = {"content_status": "published"}
-    cursor = news_collection.find(query).sort([("source_count", -1), ("published_at", -1)]).limit(limit)
-    items = [ArticleDocument(**clean_doc(d)) for d in cursor]
+    try:
+        query = {"content_status": "published"}
+        cursor = news_collection.find(query).sort([("source_count", -1), ("published_at", -1)]).limit(limit)
+        items = [ArticleDocument(**clean_doc(d)) for d in cursor]
+    except Exception as e:
+        logger.error(f"[Trending Error]: {e}")
+        items = []
 
     return NewsListResponse(
         items=items,
@@ -168,17 +181,21 @@ def get_categories():
     if news_collection is None:
         return []
 
-    pipeline = [
-        {"$match": {"content_status": "published"}},
-        {"$group": {"_id": "$category", "count": {"$sum": 1}}},
-        {"$sort": {"count": -1}}
-    ]
-    results = list(news_collection.aggregate(pipeline))
-    categories = []
-    for r in results:
-        cat_name = str(r["_id"]).title()
-        categories.append(CategoryCountItem(name=cat_name, slug=str(r["_id"]), count=r["count"]))
-    return categories
+    try:
+        pipeline = [
+            {"$match": {"content_status": "published"}},
+            {"$group": {"_id": "$category", "count": {"$sum": 1}}},
+            {"$sort": {"count": -1}}
+        ]
+        results = list(news_collection.aggregate(pipeline))
+        categories = []
+        for r in results:
+            cat_name = str(r["_id"]).title()
+            categories.append(CategoryCountItem(name=cat_name, slug=str(r["_id"]), count=r["count"]))
+        return categories
+    except Exception as e:
+        logger.error(f"[Categories Error]: {e}")
+        return []
 
 @app.get("/api/search", response_model=NewsListResponse, tags=["Search"])
 def search_articles(
@@ -190,24 +207,28 @@ def search_articles(
     if news_collection is None or not q.strip():
         return NewsListResponse(items=[], pagination=PaginationMetadata(page=page, limit=limit, total=0, has_next=False))
 
-    regex_query = {"$regex": q.strip(), "$options": "i"}
-    match_condition = {
-        "content_status": "published",
-        "$or": [
-            {"title": regex_query},
-            {"summary": regex_query},
-            {"dek": regex_query}
-        ]
-    }
-    if category:
-        match_condition["category"] = category.lower()
+    try:
+        regex_query = {"$regex": q.strip(), "$options": "i"}
+        match_condition = {
+            "content_status": "published",
+            "$or": [
+                {"title": regex_query},
+                {"summary": regex_query},
+                {"dek": regex_query}
+            ]
+        }
+        if category:
+            match_condition["category"] = category.lower()
 
-    total = news_collection.count_documents(match_condition)
-    skip = (page - 1) * limit
-    cursor = news_collection.find(match_condition).sort("published_at", -1).skip(skip).limit(limit)
+        total = news_collection.count_documents(match_condition)
+        skip = (page - 1) * limit
+        cursor = news_collection.find(match_condition).sort("published_at", -1).skip(skip).limit(limit)
 
-    items = [ArticleDocument(**clean_doc(d)) for d in cursor]
-    has_next = (skip + limit) < total
+        items = [ArticleDocument(**clean_doc(d)) for d in cursor]
+        has_next = (skip + limit) < total
+    except Exception as e:
+        logger.error(f"[Search Error]: {e}")
+        return NewsListResponse(items=[], pagination=PaginationMetadata(page=page, limit=limit, total=0, has_next=False))
 
     return NewsListResponse(
         items=items,
@@ -233,9 +254,13 @@ def get_admin_metrics(x_admin_key: Optional[str] = Header(None)):
     if news_collection is None:
         raise HTTPException(status_code=503, detail="Database unavailable")
 
-    total_articles = news_collection.count_documents({})
-    pipeline = [{"$group": {"_id": "$category", "count": {"$sum": 1}}}]
-    category_counts = [{"category": r["_id"], "count": r["count"]} for r in news_collection.aggregate(pipeline)]
+    try:
+        total_articles = news_collection.count_documents({})
+        pipeline = [{"$group": {"_id": "$category", "count": {"$sum": 1}}}]
+        category_counts = [{"category": r["_id"], "count": r["count"]} for r in news_collection.aggregate(pipeline)]
+    except Exception:
+        total_articles = 0
+        category_counts = []
 
     return AdminStatsResponse(
         total_articles=total_articles,
@@ -258,7 +283,11 @@ def get_main_sitemap():
     if news_collection is None:
         return PlainResponse("<urlset xmlns='http://www.sitemaps.org/schemas/sitemap/0.9'></urlset>", media_type="application/xml")
 
-    articles = list(news_collection.find({"content_status": "published"}).sort("published_at", -1).limit(100))
+    try:
+        articles = list(news_collection.find({"content_status": "published"}).sort("published_at", -1).limit(100))
+    except Exception:
+        articles = []
+
     xml_lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
@@ -280,7 +309,11 @@ def get_news_sitemap():
     if news_collection is None:
         return PlainResponse("<urlset xmlns='http://www.sitemaps.org/schemas/sitemap/0.9'></urlset>", media_type="application/xml")
 
-    articles = list(news_collection.find({"content_status": "published"}).sort("published_at", -1).limit(50))
+    try:
+        articles = list(news_collection.find({"content_status": "published"}).sort("published_at", -1).limit(50))
+    except Exception:
+        articles = []
+
     xml_lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:news="http://www.google.com/schemas/sitemap-news/0.9">'
@@ -301,3 +334,10 @@ def get_news_sitemap():
 
     xml_lines.append('</urlset>')
     return PlainResponse("\n".join(xml_lines), media_type="application/xml")
+
+# ==========================================
+# ENTRY POINT FOR RENDER (python main.py)
+# ==========================================
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info")
