@@ -1,5 +1,5 @@
 import os
-from typing import List
+from typing import List, Dict
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -15,7 +15,7 @@ MONGO_COLLECTION_NAME = os.getenv("MONGO_COLLECTION_NAME", "news_posts")
 
 # AI Engine
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 
 # Security & Admin
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "tezkhabar-secret-admin-key-2026")
@@ -23,8 +23,8 @@ GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON", "")
 
 # Scraper Settings
 SCRAPER_INTERVAL_SECONDS = int(os.getenv("SCRAPER_INTERVAL_SECONDS", "600"))
-MAX_ARTICLES_PER_FEED = int(os.getenv("MAX_ARTICLES_PER_FEED", "10"))
-REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "12"))
+MAX_ARTICLES_PER_FEED = int(os.getenv("MAX_ARTICLES_PER_FEED", "12"))
+REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "8"))
 
 # Controlled Categories
 CONTROLLED_CATEGORIES = [
@@ -43,7 +43,7 @@ CONTROLLED_CATEGORIES = [
     "startups",
     "automobile",
     "world",
-    "viral",
+    "lifestyle",
     "science",
     "health"
 ]
@@ -59,7 +59,35 @@ CATEGORY_ALIAS_MAP = {
     "international": "world",
 }
 
-# CORS Allowed Origins
+# Domain to Publisher Known Mapping
+DOMAIN_PUBLISHER_MAP: Dict[str, str] = {
+    "ndtv.com": "NDTV",
+    "thehindu.com": "The Hindu",
+    "timesofindia.indiatimes.com": "The Times of India",
+    "indianexpress.com": "The Indian Express",
+    "hindustantimes.com": "Hindustan Times",
+    "moneycontrol.com": "Moneycontrol",
+    "livemint.com": "Mint",
+    "economictimes.indiatimes.com": "The Economic Times",
+    "indiatoday.in": "India Today",
+    "reuters.com": "Reuters",
+    "bbc.com": "BBC News",
+    "bbc.co.uk": "BBC News",
+    "deccanherald.com": "Deccan Herald",
+    "theprint.in": "ThePrint",
+    "scroll.in": "Scroll.in",
+    "thewire.in": "The Wire",
+    "news18.com": "News18",
+    "zeenews.india.com": "Zee News",
+    "business-standard.com": "Business Standard",
+    "financialexpress.com": "Financial Express",
+    "espncricinfo.com": "ESPNcricinfo",
+    "cricbuzz.com": "Cricbuzz",
+    "livelaw.in": "Live Law",
+    "barandbench.com": "Bar and Bench",
+}
+
+# CORS Production Origins
 ALLOWED_ORIGINS: List[str] = [
     "https://tezkhabar-frontend.onrender.com",
     "http://localhost:3000",

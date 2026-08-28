@@ -2,9 +2,10 @@ import re
 import json
 import logging
 import unicodedata
+from typing import Dict, Any, Optional
 from groq import Groq
 import config
-from extractor import strip_html_tags, is_valid_news_title
+from extractor import strip_html_tags
 
 logger = logging.getLogger("tezkhabar.ai")
 groq_client = None
@@ -39,30 +40,48 @@ def generate_cluster_id(title: str, category: str) -> str:
     signature = "-".join(key_words[:4]) if key_words else "cluster"
     return f"{category}-{signature}"
 
-def process_article_with_ai(title: str, raw_text: str, source_name: str, feed_cat: str) -> dict:
+def process_article_with_ai(title: str, source_body: Optional[str], source_name: str, feed_cat: str) -> Dict[str, Any]:
+    """
+    Summarizes news factually using Groq ONLY when verified source content exists.
+    """
     normalized_cat = normalize_category(feed_cat)
-    clean_summary = strip_html_tags(raw_text)[:300] if raw_text else title
-    
+
+    if not source_body or len(source_body.split()) < 20:
+        return {
+            "dek": "",
+            "summary": title,
+            "category": normalized_cat,
+            "subcategory": "India",
+            "content": None,
+            "key_facts": [],
+            "why_it_matters": None,
+            "ai_generated": False,
+            "ai_status": "skipped_no_source",
+            "confidence": "developing"
+        }
+
+    clean_summary = strip_html_tags(source_body)[:300]
     fallback_result = {
         "dek": clean_summary[:140],
         "summary": clean_summary,
         "category": normalized_cat,
         "subcategory": "India",
-        "content": f"<p>{raw_text[:800]}</p>",
+        "content": f"<p>{source_body[:1000]}</p>",
         "key_facts": [title],
-        "why_it_matters": f"Reported by {source_name} regarding ongoing developments.",
+        "why_it_matters": f"Reported by {source_name}.",
         "ai_generated": False,
+        "ai_status": "fallback",
         "confidence": "developing"
     }
 
     if not groq_client:
         return fallback_result
 
-    prompt = f"""You are a senior editorial news assistant for TezKhabar.
+    prompt = f"""You are a senior editorial news intelligence assistant for TezKhabar.
 Summarize this news report strictly and factually.
 RULES:
 1. Never invent facts, quotes, statistics, dates, or names.
-2. Maintain neutral, objective journalistic tone.
+2. Ground all text strictly in the provided Article Body.
 3. Output valid JSON only matching this schema:
 
 {{
@@ -78,7 +97,7 @@ RULES:
 
 Publisher: {source_name}
 Title: {title}
-Article Body: {raw_text[:2500]}
+Article Body: {source_body[:2500]}
 """
 
     for model_name in [config.GROQ_MODEL, "llama-3.1-8b-instant", "llama3-70b-8192", "llama3-8b-8192"]:
@@ -98,6 +117,7 @@ Article Body: {raw_text[:2500]}
             parsed = json.loads(content)
             parsed["category"] = normalize_category(parsed.get("category", normalized_cat))
             parsed["ai_generated"] = True
+            parsed["ai_status"] = "success"
             return parsed
         except Exception:
             continue

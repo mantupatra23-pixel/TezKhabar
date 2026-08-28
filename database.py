@@ -38,7 +38,7 @@ def get_news_collection() -> Collection:
 
 def cleanup_invalid_google_news_records():
     """
-    Purges/rejects Google News feed wrapper records and strips generic placeholder images.
+    Purges generic feed wrapper records, re-maps publisher names, and validates images.
     """
     try:
         col = get_news_collection()
@@ -50,7 +50,7 @@ def cleanup_invalid_google_news_records():
                 {"$set": {"content_status": "rejected"}}
             )
 
-        # 2. Reject records where source is generic feed and title is invalid
+        # 2. Reject records where title starts or ends with Google News
         col.update_many(
             {
                 "$or": [
@@ -74,8 +74,11 @@ def cleanup_invalid_google_news_records():
             valid_img = validate_and_normalize_image(raw_img)
 
             source_name = doc.get("source_name") or doc.get("source") or "TezKhabar Wire"
-            if source_name.lower().startswith("google news"):
-                source_name = doc.get("source_domain", "TezKhabar Wire").replace("www.", "")
+            domain = doc.get("source_domain", "")
+            if source_name.lower().startswith("google news") and domain:
+                source_name = config.DOMAIN_PUBLISHER_MAP.get(domain, domain.replace("www.", "").title())
+
+            clean_summary = strip_html_tags(doc.get("summary") or doc.get("dek") or title)
 
             col.update_one(
                 {"_id": doc["_id"]},
@@ -85,12 +88,14 @@ def cleanup_invalid_google_news_records():
                         "image_url": valid_img,
                         "source": source_name,
                         "source_name": source_name,
+                        "summary": clean_summary,
+                        "description": clean_summary,
                     }
                 }
             )
 
         valid_count = col.count_documents({"content_status": "published"})
-        logger.info(f"[DB Cleanup] Completed. Verified published articles in database: {valid_count}")
+        logger.info(f"[DB Cleanup] Verified published articles in database: {valid_count}")
     except Exception as e:
         logger.error(f"[DB Cleanup Error]: {e}")
 

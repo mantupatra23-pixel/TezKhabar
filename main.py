@@ -22,7 +22,10 @@ from schemas import (
     AdminStatsResponse,
     ArticleDocument,
     PaginationMetadata,
+    ExtractionDebugRequest,
+    ExtractionDebugResponse
 )
+from extractor import extract_article
 from scraper import run_news_scraper, background_scraper_loop, scraper_stats
 
 logging.basicConfig(
@@ -33,7 +36,7 @@ logger = logging.getLogger("tezkhabar.main")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("[Startup] Connecting to MongoDB and cleaning invalid records...")
+    logger.info("[Startup] Connecting to MongoDB and verifying database integrity...")
     db_connected = init_db()
     if db_connected:
         scraper_thread = threading.Thread(target=background_scraper_loop, daemon=True)
@@ -45,7 +48,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="TezKhabar News Intelligence API",
     description="Production editorial news ingestion, clustering and article routing engine.",
-    version="6.2.0",
+    version="6.3.0",
     lifespan=lifespan
 )
 
@@ -84,7 +87,8 @@ def clean_doc(doc: dict) -> dict:
     doc["dek"] = dek
     doc["summary"] = summary
     doc["description"] = summary
-    doc["content"] = str(doc.get("content") or f"<p>{summary}</p>")
+    doc["content"] = doc.get("content")
+    doc["source_content"] = doc.get("source_content")
     doc["category"] = str(doc.get("category") or "india").lower()
     doc["subcategory"] = str(doc.get("subcategory") or "India")
     doc["source"] = source_name
@@ -95,7 +99,7 @@ def clean_doc(doc: dict) -> dict:
     doc["published_at"] = pub_date
     doc["created_at"] = str(doc.get("created_at") or pub_date)
     doc["canonical_url"] = str(doc.get("canonical_url") or f"{config.FRONTEND_URL}/news/{slug}")
-    doc["content_status"] = "published"
+    doc["content_status"] = doc.get("content_status", "published")
     doc["sources"] = doc.get("sources") if isinstance(doc.get("sources"), list) else []
     doc["key_facts"] = doc.get("key_facts") if isinstance(doc.get("key_facts"), list) else []
     doc["timeline"] = doc.get("timeline") if isinstance(doc.get("timeline"), list) else []
@@ -104,12 +108,15 @@ def clean_doc(doc: dict) -> dict:
     doc["confidence"] = str(doc.get("confidence") or "developing")
     return doc
 
+# ==========================================
+# HEALTH & SERVICE STATUS
+# ==========================================
 @app.get("/", tags=["Health"])
 def root_info():
     return {
         "status": "ok",
         "service": "TezKhabar Backend Engine",
-        "version": "6.2.0",
+        "version": "6.3.0",
         "frontend": config.FRONTEND_URL,
         "database": get_db_health()
     }
@@ -123,9 +130,13 @@ def health_check():
         "status": "ok",
         "service": "tezkhabar-backend",
         "database": "connected",
-        "version": "6.2.0"
+        "ai": "ok" if config.GROQ_API_KEY else "disabled",
+        "version": "6.3.0"
     }
 
+# ==========================================
+# PUBLIC NEWS APIS
+# ==========================================
 @app.get("/api/news", response_model=NewsListResponse, tags=["News"])
 def get_news_list(
     category: Optional[str] = Query(None, description="Category filter"),
@@ -137,7 +148,7 @@ def get_news_list(
     if col is None:
         return NewsListResponse(items=[], pagination=PaginationMetadata(page=page, limit=limit, total=0, has_next=False))
 
-    query = {"content_status": "published"}
+    query = {"content_status": {"$in": ["published", "source_unavailable"]}}
     if category:
         query["category"] = category.lower()
 
@@ -164,9 +175,9 @@ def lookup_article_by_slug(raw_slug: str):
     safe_slug = urllib.parse.unquote(raw_slug).strip().lower()
 
     try:
-        doc = col.find_one({"slug": safe_slug, "content_status": "published"})
+        doc = col.find_one({"slug": safe_slug})
         if not doc:
-            doc = col.find_one({"_id": safe_slug, "content_status": "published"})
+            doc = col.find_one({"_id": safe_slug})
     except Exception as e:
         logger.error(f"[Article Lookup Error] Slug '{safe_slug}': {e}")
         raise HTTPException(status_code=500, detail="Internal database error")
@@ -255,9 +266,41 @@ def search_articles(
         pagination=PaginationMetadata(page=page, limit=limit, total=total, has_next=has_next)
     )
 
+# ==========================================
+# DIAGNOSTIC & ADMIN ENDPOINTS
+# ==========================================
 def verify_admin(x_admin_key: Optional[str] = Header(None)):
     if not x_admin_key or x_admin_key != config.ADMIN_API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized: Invalid Admin Credentials")
+
+@app.post("/api/debug/extract", response_model=ExtractionDebugResponse, tags=["Admin"])
+def debug_extract_url(payload: ExtractionDebugRequest, x_admin_key: Optional[str] = Header(None)):
+    verify_admin(x_admin_key)
+    res = extract_article(payload.url)
+    if not res["success"]:
+        return ExtractionDebugResponse(
+            resolved_url=res.get("resolved_url", payload.url),
+            canonical_url=None,
+            source_name="Unknown",
+            title="Failed",
+            image_url=None,
+            published_at=None,
+            content_length=0,
+            image_valid=False,
+            status=f"error: {res.get('error')}"
+        )
+
+    return ExtractionDebugResponse(
+        resolved_url=res["resolved_url"],
+        canonical_url=res.get("canonical_url"),
+        source_name=res["publisher_name"],
+        title=res["title"],
+        image_url=res.get("image_url"),
+        published_at=res.get("published_at"),
+        content_length=len(res.get("body", "") or ""),
+        image_valid=bool(res.get("image_url")),
+        status="ok"
+    )
 
 @app.post("/api/admin/scrape-now", tags=["Admin"])
 def trigger_manual_scrape(x_admin_key: Optional[str] = Header(None)):

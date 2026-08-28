@@ -1,4 +1,4 @@
-from typing import List, Optional, Any
+from typing import List, Optional, Any, Dict
 from pydantic import BaseModel, Field
 
 class NewsSourceItem(BaseModel):
@@ -15,7 +15,8 @@ class ArticleDocument(BaseModel):
     dek: str = ""
     summary: str = ""
     description: str = ""
-    content: str = ""
+    content: Optional[str] = None
+    source_content: Optional[str] = None
     category: str = "india"
     subcategory: Optional[str] = "India"
     badge: Optional[str] = None
@@ -26,7 +27,7 @@ class ArticleDocument(BaseModel):
     source_url: str = "#"
     source_domain: Optional[str] = None
     author: Optional[str] = None
-    published_at: str
+    published_at: Optional[str] = None
     updated_at: Optional[str] = None
     created_at: str
     language: str = "en"
@@ -39,6 +40,7 @@ class ArticleDocument(BaseModel):
     timeline: List[dict] = []
     ai_summary: Optional[str] = None
     ai_generated: bool = False
+    ai_status: str = "skipped"
     content_status: str = "published"
     confidence: str = "developing"
     canonical_source_url: Optional[str] = None
@@ -74,3 +76,17 @@ class AdminStatsResponse(BaseModel):
     articles_saved: int
     articles_skipped: int
     category_counts: List[dict]
+
+class ExtractionDebugRequest(BaseModel):
+    url: str
+
+class ExtractionDebugResponse(BaseModel):
+    resolved_url: str
+    canonical_url: Optional[str] = None
+    source_name: str
+    title: str
+    image_url: Optional[str] = None
+    published_at: Optional[str] = None
+    content_length: int
+    image_valid: bool
+    status: str

@@ -40,7 +40,7 @@ RSS_FEEDS = [
 
 def run_news_scraper() -> dict:
     if not scrape_lock.acquire(blocking=False):
-        logger.warning("[Scraper] Scraper is already running. Skipping concurrent run.")
+        logger.warning("[Scraper] Scraper is already active. Skipping concurrent run.")
         return {"status": "already_running"}
 
     start_iso = datetime.now(timezone.utc).isoformat()
@@ -79,23 +79,19 @@ def run_news_scraper() -> dict:
                     articles_skipped += 1
                     continue
 
-                # Filter out generic feed titles immediately
                 if not is_valid_news_title(raw_title):
-                    logger.info(f"[Scraper] REJECTED feed-level item: '{raw_title}'")
                     articles_skipped += 1
                     continue
 
                 source_url = clean_source_url(raw_url)
 
-                # Duplicate check by source URL
                 if col.find_one({"$or": [{"source_url": source_url}, {"canonical_source_url": source_url}]}):
                     articles_skipped += 1
                     continue
 
                 new_candidates += 1
-                logger.info(f"[Scraper] Resolving destination article: '{raw_title[:45]}...'")
 
-                # Resolve original publisher and extract rich metadata
+                # Resolve original destination URL & extract metadata
                 extracted = extract_article(source_url, fallback_title=raw_title, fallback_summary=raw_summary)
                 if not extracted["success"]:
                     articles_skipped += 1
@@ -103,13 +99,15 @@ def run_news_scraper() -> dict:
 
                 article_title = extracted["title"]
                 resolved_url = extracted["resolved_url"]
+                canonical_source_url = extracted["canonical_url"]
                 publisher_name = extracted["publisher_name"]
                 publisher_image = extracted["image_url"]
                 article_body = extracted["body"]
                 domain = extracted["source_domain"]
+                has_source_content = extracted["has_source_content"]
 
                 # Deduplicate by resolved publisher URL
-                if col.find_one({"canonical_source_url": resolved_url}):
+                if col.find_one({"$or": [{"canonical_source_url": canonical_source_url}, {"source_url": resolved_url}]}):
                     articles_skipped += 1
                     continue
 
@@ -138,10 +136,9 @@ def run_news_scraper() -> dict:
                     articles_saved += 1
                     continue
 
-                # AI Enrichment
+                # AI Enrichment (Only on real source body)
                 ai_data = process_article_with_ai(article_title, article_body, publisher_name, feed_cat)
 
-                # Generate Unique Slug
                 base_slug = create_slug(article_title)
                 slug = base_slug
                 counter = 2
@@ -158,7 +155,8 @@ def run_news_scraper() -> dict:
                     "dek": ai_data.get("dek", clean_summary[:140]),
                     "summary": clean_summary,
                     "description": clean_summary,
-                    "content": ai_data.get("content", f"<p>{article_body}</p>"),
+                    "content": ai_data.get("content") or (f"<p>{article_body}</p>" if article_body else None),
+                    "source_content": article_body,
                     "category": ai_data.get("category", feed_cat),
                     "subcategory": "India",
                     "badge": "Breaking" if feed_cat in ["politics", "india"] else None,
@@ -168,7 +166,7 @@ def run_news_scraper() -> dict:
                     "source_name": publisher_name,
                     "source_domain": domain,
                     "source_url": resolved_url,
-                    "canonical_source_url": resolved_url,
+                    "canonical_source_url": canonical_source_url,
                     "canonical_url": f"{config.FRONTEND_URL}/news/{slug}",
                     "author": extracted.get("author") or publisher_name,
                     "published_at": pub_time,
@@ -185,18 +183,19 @@ def run_news_scraper() -> dict:
                         "domain": domain
                     }],
                     "key_facts": ai_data.get("key_facts", []),
-                    "why_it_matters": ai_data.get("why_it_matters", ""),
+                    "why_it_matters": ai_data.get("why_it_matters"),
                     "timeline": [],
-                    "ai_summary": clean_summary,
+                    "ai_summary": clean_summary if ai_data.get("ai_generated") else None,
                     "ai_generated": ai_data.get("ai_generated", False),
-                    "content_status": "published",
+                    "ai_status": ai_data.get("ai_status", "skipped"),
+                    "content_status": "published" if has_source_content else "source_unavailable",
                     "confidence": ai_data.get("confidence", "developing"),
-                    "word_count": extracted.get("word_count", len(article_body.split())),
+                    "word_count": extracted.get("word_count", 0),
                 }
 
                 col.insert_one(doc)
                 articles_saved += 1
-                logger.info(f"[Scraper] Saved Real Article: '{article_title[:45]}' | Publisher: {publisher_name} | Image: {'YES' if publisher_image else 'NO'}")
+                logger.info(f"[Scraper] Saved: '{article_title[:42]}' | Publisher: {publisher_name} | Image: {'OK' if publisher_image else 'NONE'}")
 
         scraper_stats["last_scrape_success"] = True
     except Exception as e:

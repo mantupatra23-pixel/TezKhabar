@@ -50,11 +50,12 @@ GENERIC_IMAGE_PATTERNS = [
     "icon.png",
     "spacer.gif",
     "avatar",
-    "share-icon"
+    "share-icon",
+    "tezkhabar"
 ]
 
 HTTP_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 TezKhabarEditorial/6.1",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 TezKhabarEditorial/6.2",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9,hi;q=0.8",
 }
@@ -76,6 +77,13 @@ def is_safe_url(url: str) -> bool:
     except Exception:
         return False
 
+def strip_html_tags(raw_html: str = "") -> str:
+    if not raw_html:
+        return ""
+    clean = re.sub(r"<[^>]*>", " ", str(raw_html))
+    clean = html.unescape(clean)
+    return re.sub(r"\s+", " ", clean).strip()
+
 def clean_source_url(url: str) -> str:
     try:
         parsed = urllib.parse.urlparse(url)
@@ -88,13 +96,6 @@ def clean_source_url(url: str) -> str:
     except Exception:
         return url
 
-def strip_html_tags(raw_html: str = "") -> str:
-    if not raw_html:
-        return ""
-    clean = re.sub(r"<[^>]*>", " ", str(raw_html))
-    clean = html.unescape(clean)
-    return re.sub(r"\s+", " ", clean).strip()
-
 def is_valid_news_title(title: str) -> bool:
     if not title or len(title.strip()) < 10:
         return False
@@ -106,6 +107,9 @@ def is_valid_news_title(title: str) -> bool:
     return True
 
 def resolve_publisher_url(source_url: str) -> str:
+    """
+    Unmasks Google News RSS wrapper links to identify the original publisher page.
+    """
     if "news.google.com" not in source_url:
         return source_url
     if not is_safe_url(source_url):
@@ -117,23 +121,27 @@ def resolve_publisher_url(source_url: str) -> str:
         resp = session.get(source_url, headers=HTTP_HEADERS, timeout=6, allow_redirects=True)
         final_url = resp.url
         if "news.google.com" not in final_url:
-            return final_url
+            return clean_source_url(final_url)
 
         soup = BeautifulSoup(resp.content, "html.parser")
         canonical = soup.find("link", rel="canonical")
         if canonical and canonical.get("href") and "news.google.com" not in canonical["href"]:
-            return canonical["href"]
+            return clean_source_url(canonical["href"])
 
         for a in soup.find_all("a", href=True):
             href = a["href"]
             if href.startswith("http") and "google.com" not in href:
-                return href
+                return clean_source_url(href)
 
-        return final_url
+        return clean_source_url(final_url)
     except Exception:
         return source_url
 
 def validate_and_normalize_image(image_url: Optional[str], base_url: str = "") -> Optional[str]:
+    """
+    Performs HTTP HEAD/GET verification on candidate image URL.
+    Rejects generic Google News icons, SVG icons, and tracking beacons.
+    """
     if not image_url or not isinstance(image_url, str):
         return None
 
@@ -149,13 +157,16 @@ def validate_and_normalize_image(image_url: Optional[str], base_url: str = "") -
         if pattern in lower_url:
             return None
 
+    if not is_safe_url(clean_url):
+        return None
+
     try:
         resp = requests.head(clean_url, headers=HTTP_HEADERS, timeout=4, allow_redirects=True)
         if resp.status_code == 200:
             ct = resp.headers.get("Content-Type", "").lower()
-            if ct.startswith("image/") and "svg" not in ct:
+            if any(ct.startswith(valid) for valid in ["image/jpeg", "image/png", "image/webp", "image/avif"]):
                 cl = resp.headers.get("Content-Length")
-                if cl and int(cl) < 1500:
+                if cl and int(cl) < 2000:  # Filter tracking pixels
                     return None
                 return resp.url
     except Exception:
@@ -171,15 +182,23 @@ def extract_json_ld(soup: BeautifulSoup) -> Dict[str, Any]:
             data = json.loads(script.string)
             items = data if isinstance(data, list) else data.get("@graph", [data])
             for item in items:
-                if isinstance(item, dict) and item.get("@type") in ("NewsArticle", "Article", "ReportageNewsArticle"):
+                if isinstance(item, dict) and item.get("@type") in (
+                    "NewsArticle",
+                    "Article",
+                    "ReportageNewsArticle",
+                    "BlogPosting"
+                ):
                     return item
         except Exception:
             continue
     return {}
 
 def extract_article(target_url: str, fallback_title: str = "", fallback_summary: str = "") -> Dict[str, Any]:
+    """
+    Fetches real publisher article, extracts structured metadata, real publisher images, and body content.
+    """
     real_url = resolve_publisher_url(target_url)
-    domain = urllib.parse.urlparse(real_url).netloc.replace("www.", "")
+    parsed_domain = urllib.parse.urlparse(real_url).netloc.lower().replace("www.", "")
 
     if not is_safe_url(real_url):
         return {"success": False, "error": "SSRF_BLOCKED"}
@@ -192,15 +211,16 @@ def extract_article(target_url: str, fallback_title: str = "", fallback_summary:
         soup = BeautifulSoup(resp.content, "html.parser")
         json_ld = extract_json_ld(soup)
 
+        # 1. Headline Extraction: JSON-LD headline -> og:title -> title tag -> fallback
         og_title = soup.find("meta", property="og:title")
         tw_title = soup.find("meta", {"name": "twitter:title"})
         title_tag = soup.title.string.strip() if soup.title and soup.title.string else ""
 
         extracted_title = ""
-        if og_title and og_title.get("content"):
-            extracted_title = og_title["content"].strip()
-        elif json_ld.get("headline"):
+        if json_ld.get("headline"):
             extracted_title = str(json_ld["headline"]).strip()
+        elif og_title and og_title.get("content"):
+            extracted_title = og_title["content"].strip()
         elif tw_title and tw_title.get("content"):
             extracted_title = tw_title["content"].strip()
         elif title_tag:
@@ -217,15 +237,24 @@ def extract_article(target_url: str, fallback_title: str = "", fallback_summary:
         if not is_valid_news_title(extracted_title):
             return {"success": False, "error": "INVALID_ARTICLE_TITLE"}
 
-        publisher_name = ""
-        if isinstance(json_ld.get("publisher"), dict) and json_ld["publisher"].get("name"):
-            publisher_name = str(json_ld["publisher"]["name"]).strip()
-        elif soup.find("meta", property="og:site_name"):
-            publisher_name = soup.find("meta", property="og:site_name").get("content", "").strip()
-        
-        if not publisher_name or publisher_name.lower() in FORBIDDEN_TITLES:
-            publisher_name = domain.split(".")[0].upper() if domain else "TezKhabar Wire"
+        # 2. Publisher Name Extraction: Domain Map -> JSON-LD publisher -> og:site_name
+        publisher_name = config.DOMAIN_PUBLISHER_MAP.get(parsed_domain)
+        if not publisher_name:
+            if isinstance(json_ld.get("publisher"), dict) and json_ld["publisher"].get("name"):
+                publisher_name = str(json_ld["publisher"]["name"]).strip()
+            elif soup.find("meta", property="og:site_name"):
+                publisher_name = soup.find("meta", property="og:site_name").get("content", "").strip()
 
+        if not publisher_name or publisher_name.lower() in FORBIDDEN_TITLES:
+            publisher_name = parsed_domain.split(".")[0].title() if parsed_domain else "TezKhabar Wire"
+
+        # 3. Canonical URL
+        canonical_tag = soup.find("link", rel="canonical")
+        canonical_url = canonical_tag.get("href") if canonical_tag and canonical_tag.get("href") else real_url
+        if not canonical_url.startswith("http"):
+            canonical_url = real_url
+
+        # 4. Image Extraction: JSON-LD image -> og:image -> twitter:image -> article img
         extracted_img = None
         if json_ld.get("image"):
             img_val = json_ld["image"]
@@ -247,7 +276,7 @@ def extract_article(target_url: str, fallback_title: str = "", fallback_summary:
                 extracted_img = tw_img["content"]
 
         if not extracted_img:
-            art_img = soup.find("article")
+            art_img = soup.find("article") or soup.find("main")
             if art_img:
                 img_tag = art_img.find("img")
                 if img_tag and img_tag.get("src"):
@@ -255,13 +284,14 @@ def extract_article(target_url: str, fallback_title: str = "", fallback_summary:
 
         valid_image_url = validate_and_normalize_image(extracted_img, base_url=real_url)
 
+        # 5. Summary / Description
         og_desc = soup.find("meta", property="og:description")
         meta_desc = soup.find("meta", {"name": "description"})
         extracted_desc = ""
-        if og_desc and og_desc.get("content"):
-            extracted_desc = og_desc["content"].strip()
-        elif json_ld.get("description"):
+        if json_ld.get("description"):
             extracted_desc = str(json_ld["description"]).strip()
+        elif og_desc and og_desc.get("content"):
+            extracted_desc = og_desc["content"].strip()
         elif meta_desc and meta_desc.get("content"):
             extracted_desc = meta_desc["content"].strip()
         else:
@@ -269,6 +299,7 @@ def extract_article(target_url: str, fallback_title: str = "", fallback_summary:
 
         extracted_desc = strip_html_tags(extracted_desc)
 
+        # 6. Clean Body Content
         for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form", "iframe", "noscript", "svg"]):
             tag.decompose()
 
@@ -276,16 +307,15 @@ def extract_article(target_url: str, fallback_title: str = "", fallback_summary:
         paragraphs = []
         for p in article_container.find_all("p"):
             text = strip_html_tags(p.get_text())
-            if len(text) > 35 and not any(junk in text.lower() for junk in ["subscribe", "cookie policy", "terms of use", "all rights reserved", "click here", "sign up"]):
+            if len(text) > 35 and not any(junk in text.lower() for junk in ["subscribe", "cookie policy", "terms of use", "all rights reserved", "click here", "sign up", "download the app"]):
                 paragraphs.append(text)
 
-        body_text = " ".join(paragraphs) if paragraphs else extracted_desc
-        if len(body_text.split()) < 20 and len(extracted_desc.split()) >= 15:
-            body_text = extracted_desc
+        body_text = " ".join(paragraphs) if paragraphs else (json_ld.get("articleBody") or extracted_desc)
+        body_text = strip_html_tags(body_text)
 
-        if len(body_text.split()) < 15:
-            return {"success": False, "error": "CONTENT_INSUFFICIENT"}
+        has_source_content = len(body_text.split()) >= 20
 
+        # 7. Real Publication Date
         meta_pub = soup.find("meta", property="article:published_time") or soup.find("meta", {"name": "pubdate"})
         published_at = None
         if json_ld.get("datePublished"):
@@ -299,14 +329,16 @@ def extract_article(target_url: str, fallback_title: str = "", fallback_summary:
             "success": True,
             "title": extracted_title,
             "description": extracted_desc or body_text[:240],
-            "body": body_text[:4000],
+            "body": body_text[:4000] if has_source_content else None,
+            "has_source_content": has_source_content,
             "image_url": valid_image_url,
             "publisher_name": publisher_name,
             "resolved_url": real_url,
-            "source_domain": domain,
+            "canonical_url": canonical_url,
+            "source_domain": parsed_domain,
             "published_at": published_at,
             "author": author or publisher_name,
-            "word_count": len(body_text.split()),
+            "word_count": len(body_text.split()) if has_source_content else 0,
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
