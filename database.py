@@ -10,7 +10,9 @@ logger = logging.getLogger("tezkhabar.db")
 
 _mongo_client: MongoClient = None
 _db: Database = None
-_news_collection: Collection = None
+_news_col: Collection = None
+_sources_col: Collection = None
+_revisions_col: Collection = None
 
 def get_mongo_client() -> MongoClient:
     global _mongo_client
@@ -30,92 +32,106 @@ def get_db() -> Database:
     return _db
 
 def get_news_collection() -> Collection:
-    global _news_collection
-    if _news_collection is None:
+    global _news_col
+    if _news_col is None:
         db_instance = get_db()
-        _news_collection = db_instance[config.MONGO_COLLECTION_NAME]
-    return _news_collection
+        _news_col = db_instance[config.MONGO_COLLECTION_NAME]
+    return _news_col
 
-def cleanup_invalid_google_news_records():
+def get_sources_collection() -> Collection:
+    global _sources_col
+    if _sources_col is None:
+        db_instance = get_db()
+        _sources_col = db_instance[config.MONGO_SOURCES_COLLECTION]
+    return _sources_col
+
+def get_revisions_collection() -> Collection:
+    global _revisions_col
+    if _revisions_col is None:
+        db_instance = get_db()
+        _revisions_col = db_instance[config.MONGO_REVISIONS_COLLECTION]
+    return _revisions_col
+
+def migrate_and_clean_database():
     """
-    Purges generic feed wrapper records, re-maps publisher names, and validates images.
+    Cleans previous aggregator records: unpublishes fake Google News wrappers,
+    assigns TezKhabar Editorial Desk as default public author, and normalizes public fields.
     """
     try:
         col = get_news_collection()
-        
-        # 1. Reject records with generic feed titles
+
+        # 1. Unpublish generic feed items
         for title in FORBIDDEN_TITLES:
             col.update_many(
                 {"title": {"$regex": f"^{re.escape(title)}$", "$options": "i"}},
-                {"$set": {"content_status": "rejected"}}
+                {"$set": {"status": "rejected", "content_status": "rejected"}}
             )
 
-        # 2. Reject records where title starts or ends with Google News
         col.update_many(
             {
                 "$or": [
                     {"title": {"$regex": "^Google News", "$options": "i"}},
                     {"title": {"$regex": "Google News$", "$options": "i"}},
-                ],
-                "content_status": "published"
+                    {"content": {"$regex": "News content updates shortly", "$options": "i"}}
+                ]
             },
-            {"$set": {"content_status": "rejected"}}
+            {"$set": {"status": "rejected", "content_status": "rejected"}}
         )
 
-        # 3. Clean remaining valid records
+        # 2. Update remaining records to editorial attribution standards
         cursor = col.find({"content_status": "published"})
         for doc in cursor:
-            title = doc.get("title", "")
-            if not is_valid_news_title(title):
-                col.update_one({"_id": doc["_id"]}, {"$set": {"content_status": "rejected"}})
-                continue
-
             raw_img = doc.get("image_url") or doc.get("image")
             valid_img = validate_and_normalize_image(raw_img)
-
-            source_name = doc.get("source_name") or doc.get("source") or "TezKhabar Wire"
-            domain = doc.get("source_domain", "")
-            if source_name.lower().startswith("google news") and domain:
-                source_name = config.DOMAIN_PUBLISHER_MAP.get(domain, domain.replace("www.", "").title())
-
-            clean_summary = strip_html_tags(doc.get("summary") or doc.get("dek") or title)
+            title = strip_html_tags(doc.get("title", ""))
 
             col.update_one(
                 {"_id": doc["_id"]},
                 {
                     "$set": {
+                        "author": config.DEFAULT_AUTHOR,
+                        "publisher": config.DEFAULT_PUBLISHER,
+                        "source_name": config.DEFAULT_AUTHOR,
+                        "source": config.DEFAULT_AUTHOR,
                         "image": valid_img,
                         "image_url": valid_img,
-                        "source": source_name,
-                        "source_name": source_name,
-                        "summary": clean_summary,
-                        "description": clean_summary,
+                        "title": title,
+                        "status": "published",
+                        "content_status": "published",
                     }
                 }
             )
 
         valid_count = col.count_documents({"content_status": "published"})
-        logger.info(f"[DB Cleanup] Verified published articles in database: {valid_count}")
+        logger.info(f"[DB Migration] Successfully verified {valid_count} published TezKhabar editorial records.")
     except Exception as e:
-        logger.error(f"[DB Cleanup Error]: {e}")
+        logger.error(f"[DB Migration Error]: {e}")
 
 def init_db() -> bool:
     try:
         client = get_mongo_client()
         client.admin.command("ping")
-        col = get_news_collection()
-        
-        col.create_index([("slug", ASCENDING)], unique=True, background=True)
-        col.create_index([("source_url", ASCENDING)], unique=True, background=True)
-        col.create_index([("canonical_source_url", ASCENDING)], background=True)
-        col.create_index([("published_at", DESCENDING)], background=True)
-        col.create_index([("category", ASCENDING), ("published_at", DESCENDING)], background=True)
-        col.create_index([("content_status", ASCENDING)], background=True)
+        news_col = get_news_collection()
+        sources_col = get_sources_collection()
+        revisions_col = get_revisions_collection()
 
-        cleanup_invalid_google_news_records()
+        # Indexes
+        news_col.create_index([("slug", ASCENDING)], unique=True, background=True)
+        news_col.create_index([("published_at", DESCENDING)], background=True)
+        news_col.create_index([("category", ASCENDING), ("published_at", DESCENDING)], background=True)
+        news_col.create_index([("status", ASCENDING)], background=True)
+        news_col.create_index([("story_cluster_id", ASCENDING)], background=True)
+
+        sources_col.create_index([("article_id", ASCENDING)], background=True)
+        sources_col.create_index([("source_url", ASCENDING)], unique=True, background=True)
+        sources_col.create_index([("canonical_source_url", ASCENDING)], background=True)
+
+        revisions_col.create_index([("article_id", ASCENDING)], background=True)
+
+        migrate_and_clean_database()
         return True
     except Exception as e:
-        logger.error(f"[DB] MongoDB initialization warning: {e}")
+        logger.error(f"[DB] Initialization exception: {e}")
         return False
 
 def get_db_health() -> str:

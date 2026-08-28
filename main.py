@@ -3,7 +3,7 @@ import sys
 import threading
 import logging
 import urllib.parse
-from typing import Optional
+from typing import Optional, Dict, Any
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import xml.sax.saxutils
@@ -14,18 +14,23 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response as PlainResponse
 
 import config
-from database import init_db, get_db_health, get_news_collection
-from schemas import (
-    NewsListResponse,
-    SingleArticleResponse,
-    CategoryCountItem,
-    AdminStatsResponse,
-    ArticleDocument,
-    PaginationMetadata,
-    ExtractionDebugRequest,
-    ExtractionDebugResponse
+from database import (
+    init_db,
+    get_db_health,
+    get_news_collection,
+    get_sources_collection,
+    get_revisions_collection
 )
-from extractor import extract_article
+from schemas import (
+    PublicNewsListResponse,
+    PublicSingleArticleResponse,
+    PublicArticleItem,
+    PaginationMetadata,
+    CategoryCountItem,
+    ArticleProvenanceResponse,
+    SourceProvenanceItem,
+    AdminStatsResponse
+)
 from scraper import run_news_scraper, background_scraper_loop, scraper_stats
 
 logging.basicConfig(
@@ -36,19 +41,19 @@ logger = logging.getLogger("tezkhabar.main")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("[Startup] Connecting to MongoDB and verifying database integrity...")
+    logger.info("[Startup] Connecting to MongoDB and verifying editorial collections...")
     db_connected = init_db()
     if db_connected:
         scraper_thread = threading.Thread(target=background_scraper_loop, daemon=True)
         scraper_thread.start()
-        logger.info("[Startup] Background news ingestion worker started.")
+        logger.info("[Startup] Background news ingestion & editorial worker started.")
     yield
-    logger.info("[Shutdown] Cleaning up services...")
+    logger.info("[Shutdown] Cleaning up TezKhabar services...")
 
 app = FastAPI(
-    title="TezKhabar News Intelligence API",
-    description="Production editorial news ingestion, clustering and article routing engine.",
-    version="6.3.0",
+    title="TezKhabar Editorial Wire API",
+    description="Original editorial news synthesis and verified journalism engine.",
+    version="7.0.0",
     lifespan=lifespan
 )
 
@@ -68,45 +73,53 @@ async def add_security_headers(request: Request, call_next):
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     return response
 
-def clean_doc(doc: dict) -> dict:
-    if not doc:
-        return {}
-    if "_id" in doc:
-        doc["id"] = str(doc["_id"])
-        doc["_id"] = str(doc["_id"])
-    
-    slug = str(doc.get("slug") or doc.get("id") or "news-story")
-    title = str(doc.get("title") or "News Story")
+def clean_public_article(doc: dict) -> PublicArticleItem:
+    art_id = str(doc.get("_id") or doc.get("id") or "")
+    slug = str(doc.get("slug") or art_id)
+    title = str(doc.get("title") or "Editorial Report")
     summary = str(doc.get("summary") or doc.get("description") or doc.get("dek") or title)
     dek = str(doc.get("dek") or summary[:140])
-    source_name = str(doc.get("source_name") or doc.get("source") or "TezKhabar Wire")
+    content = doc.get("content") or doc.get("body") or f"<p>{summary}</p>"
     pub_date = str(doc.get("published_at") or doc.get("created_at") or datetime.now(timezone.utc).isoformat())
 
-    doc["slug"] = slug
-    doc["title"] = title
-    doc["dek"] = dek
-    doc["summary"] = summary
-    doc["description"] = summary
-    doc["content"] = doc.get("content")
-    doc["source_content"] = doc.get("source_content")
-    doc["category"] = str(doc.get("category") or "india").lower()
-    doc["subcategory"] = str(doc.get("subcategory") or "India")
-    doc["source"] = source_name
-    doc["source_name"] = source_name
-    doc["source_domain"] = doc.get("source_domain")
-    doc["source_url"] = str(doc.get("source_url") or doc.get("canonical_source_url") or "#")
-    doc["canonical_source_url"] = doc.get("canonical_source_url") or doc["source_url"]
-    doc["published_at"] = pub_date
-    doc["created_at"] = str(doc.get("created_at") or pub_date)
-    doc["canonical_url"] = str(doc.get("canonical_url") or f"{config.FRONTEND_URL}/news/{slug}")
-    doc["content_status"] = doc.get("content_status", "published")
-    doc["sources"] = doc.get("sources") if isinstance(doc.get("sources"), list) else []
-    doc["key_facts"] = doc.get("key_facts") if isinstance(doc.get("key_facts"), list) else []
-    doc["timeline"] = doc.get("timeline") if isinstance(doc.get("timeline"), list) else []
-    doc["source_count"] = int(doc.get("source_count") or max(len(doc["sources"]), 1))
-    doc["ai_generated"] = bool(doc.get("ai_generated", False))
-    doc["confidence"] = str(doc.get("confidence") or "developing")
-    return doc
+    img = doc.get("image_url") or doc.get("image") or doc.get("imageUrl")
+
+    return PublicArticleItem(
+        id=art_id,
+        slug=slug,
+        title=title,
+        dek=dek,
+        summary=summary,
+        description=summary,
+        content=content,
+        body=content,
+        category=str(doc.get("category") or "india").lower(),
+        subcategory=str(doc.get("subcategory") or "India"),
+        badge=doc.get("badge"),
+        image=img,
+        image_url=img,
+        imageUrl=img,
+        image_source_type=doc.get("image_source_type", "editorial"),
+        image_credit=doc.get("image_credit"),
+        author=config.DEFAULT_AUTHOR,
+        publisher=config.DEFAULT_PUBLISHER,
+        source=config.DEFAULT_AUTHOR,
+        source_name=config.DEFAULT_AUTHOR,
+        published_at=pub_date,
+        publishedAt=pub_date,
+        updated_at=doc.get("updated_at"),
+        updatedAt=doc.get("updated_at"),
+        created_at=str(doc.get("created_at") or pub_date),
+        createdAt=str(doc.get("created_at") or pub_date),
+        canonical_url=f"{config.FRONTEND_URL}/news/{slug}",
+        key_facts=doc.get("key_facts") or doc.get("key_highlights") or [],
+        keyFacts=doc.get("key_facts") or doc.get("key_highlights") or [],
+        key_highlights=doc.get("key_highlights") or doc.get("key_facts") or [],
+        why_it_matters=doc.get("why_it_matters"),
+        attribution=doc.get("attribution"),
+        word_count=int(doc.get("word_count") or 0),
+        confidence=str(doc.get("confidence") or "verified")
+    )
 
 # ==========================================
 # HEALTH & SERVICE STATUS
@@ -115,8 +128,10 @@ def clean_doc(doc: dict) -> dict:
 def root_info():
     return {
         "status": "ok",
-        "service": "TezKhabar Backend Engine",
-        "version": "6.3.0",
+        "service": "TezKhabar Editorial Wire Engine",
+        "version": "7.0.0",
+        "publisher": config.DEFAULT_PUBLISHER,
+        "author": config.DEFAULT_AUTHOR,
         "frontend": config.FRONTEND_URL,
         "database": get_db_health()
     }
@@ -131,14 +146,14 @@ def health_check():
         "service": "tezkhabar-backend",
         "database": "connected",
         "ai": "ok" if config.GROQ_API_KEY else "disabled",
-        "version": "6.3.0"
+        "version": "7.0.0"
     }
 
 # ==========================================
-# PUBLIC NEWS APIS
+# PUBLIC NEWS APIS (No External URLs Leaked)
 # ==========================================
-@app.get("/api/news", response_model=NewsListResponse, tags=["News"])
-def get_news_list(
+@app.get("/api/news", response_model=PublicNewsListResponse, tags=["News"])
+def get_public_news_list(
     category: Optional[str] = Query(None, description="Category filter"),
     page: int = Query(1, ge=1),
     limit: int = Query(15, ge=1, le=50),
@@ -146,9 +161,9 @@ def get_news_list(
 ):
     col = get_news_collection()
     if col is None:
-        return NewsListResponse(items=[], pagination=PaginationMetadata(page=page, limit=limit, total=0, has_next=False))
+        return PublicNewsListResponse(items=[], pagination=PaginationMetadata(page=page, limit=limit, total=0, has_next=False))
 
-    query = {"content_status": {"$in": ["published", "source_unavailable"]}}
+    query = {"content_status": "published"}
     if category:
         query["category"] = category.lower()
 
@@ -156,18 +171,18 @@ def get_news_list(
         total = col.count_documents(query)
         skip = (page - 1) * limit
         cursor = col.find(query).sort("published_at", -1).skip(skip).limit(limit)
-        items = [ArticleDocument(**clean_doc(d)) for d in cursor]
+        items = [clean_public_article(d) for d in cursor]
         has_next = (skip + limit) < total
     except Exception as e:
         logger.error(f"[News List Error]: {e}")
-        return NewsListResponse(items=[], pagination=PaginationMetadata(page=page, limit=limit, total=0, has_next=False))
+        return PublicNewsListResponse(items=[], pagination=PaginationMetadata(page=page, limit=limit, total=0, has_next=False))
 
-    return NewsListResponse(
+    return PublicNewsListResponse(
         items=items,
         pagination=PaginationMetadata(page=page, limit=limit, total=total, has_next=has_next)
     )
 
-def lookup_article_by_slug(raw_slug: str):
+def lookup_public_article(raw_slug: str):
     col = get_news_collection()
     if col is None:
         raise HTTPException(status_code=503, detail="Database temporarily unavailable")
@@ -175,9 +190,9 @@ def lookup_article_by_slug(raw_slug: str):
     safe_slug = urllib.parse.unquote(raw_slug).strip().lower()
 
     try:
-        doc = col.find_one({"slug": safe_slug})
+        doc = col.find_one({"slug": safe_slug, "content_status": "published"})
         if not doc:
-            doc = col.find_one({"_id": safe_slug})
+            doc = col.find_one({"_id": safe_slug, "content_status": "published"})
     except Exception as e:
         logger.error(f"[Article Lookup Error] Slug '{safe_slug}': {e}")
         raise HTTPException(status_code=500, detail="Internal database error")
@@ -185,33 +200,33 @@ def lookup_article_by_slug(raw_slug: str):
     if not doc:
         return JSONResponse(status_code=404, content={"detail": "Article not found", "slug": safe_slug})
 
-    return {"article": ArticleDocument(**clean_doc(doc)).model_dump()}
+    return {"article": clean_public_article(doc).model_dump()}
 
 @app.get("/api/news/{slug}", tags=["News"])
 def get_article_by_slug(slug: str):
-    return lookup_article_by_slug(slug)
+    return lookup_public_article(slug)
 
 @app.get("/api/articles/{slug}", tags=["News"])
 def get_article_by_slug_compat(slug: str):
-    return lookup_article_by_slug(slug)
+    return lookup_public_article(slug)
 
-@app.get("/api/latest", response_model=NewsListResponse, tags=["News"])
+@app.get("/api/latest", response_model=PublicNewsListResponse, tags=["News"])
 def get_latest_news_wire(limit: int = Query(15, ge=1, le=50)):
-    return get_news_list(category=None, page=1, limit=limit, sort="latest")
+    return get_public_news_list(category=None, page=1, limit=limit, sort="latest")
 
-@app.get("/api/trending", response_model=NewsListResponse, tags=["Trending"])
+@app.get("/api/trending", response_model=PublicNewsListResponse, tags=["Trending"])
 def get_trending_news(limit: int = Query(10, ge=1, le=30)):
     col = get_news_collection()
     if col is None:
-        return NewsListResponse(items=[], pagination=PaginationMetadata(page=1, limit=limit, total=0, has_next=False))
+        return PublicNewsListResponse(items=[], pagination=PaginationMetadata(page=1, limit=limit, total=0, has_next=False))
 
     try:
-        cursor = col.find({"content_status": "published"}).sort([("source_count", -1), ("published_at", -1)]).limit(limit)
-        items = [ArticleDocument(**clean_doc(d)) for d in cursor]
+        cursor = col.find({"content_status": "published"}).sort("published_at", -1).limit(limit)
+        items = [clean_public_article(d) for d in cursor]
     except Exception:
         items = []
 
-    return NewsListResponse(
+    return PublicNewsListResponse(
         items=items,
         pagination=PaginationMetadata(page=1, limit=limit, total=len(items), has_next=False)
     )
@@ -233,7 +248,7 @@ def get_categories():
     except Exception:
         return []
 
-@app.get("/api/search", response_model=NewsListResponse, tags=["Search"])
+@app.get("/api/search", response_model=PublicNewsListResponse, tags=["Search"])
 def search_articles(
     q: str = Query(..., min_length=1, max_length=100),
     category: Optional[str] = None,
@@ -242,7 +257,7 @@ def search_articles(
 ):
     col = get_news_collection()
     if col is None or not q.strip():
-        return NewsListResponse(items=[], pagination=PaginationMetadata(page=page, limit=limit, total=0, has_next=False))
+        return PublicNewsListResponse(items=[], pagination=PaginationMetadata(page=page, limit=limit, total=0, has_next=False))
 
     try:
         regex_query = {"$regex": q.strip(), "$options": "i"}
@@ -256,57 +271,77 @@ def search_articles(
         total = col.count_documents(match_condition)
         skip = (page - 1) * limit
         cursor = col.find(match_condition).sort("published_at", -1).skip(skip).limit(limit)
-        items = [ArticleDocument(**clean_doc(d)) for d in cursor]
+        items = [clean_public_article(d) for d in cursor]
         has_next = (skip + limit) < total
     except Exception:
-        return NewsListResponse(items=[], pagination=PaginationMetadata(page=page, limit=limit, total=0, has_next=False))
+        return PublicNewsListResponse(items=[], pagination=PaginationMetadata(page=page, limit=limit, total=0, has_next=False))
 
-    return NewsListResponse(
+    return PublicNewsListResponse(
         items=items,
         pagination=PaginationMetadata(page=page, limit=limit, total=total, has_next=has_next)
     )
 
 # ==========================================
-# DIAGNOSTIC & ADMIN ENDPOINTS
+# PROTECTED PROVENANCE AUDIT & ADMIN
 # ==========================================
 def verify_admin(x_admin_key: Optional[str] = Header(None)):
     if not x_admin_key or x_admin_key != config.ADMIN_API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized: Invalid Admin Credentials")
 
-@app.post("/api/debug/extract", response_model=ExtractionDebugResponse, tags=["Admin"])
-def debug_extract_url(payload: ExtractionDebugRequest, x_admin_key: Optional[str] = Header(None)):
+@app.get("/api/admin/articles/{identifier}/provenance", response_model=ArticleProvenanceResponse, tags=["Admin"])
+def get_article_provenance(identifier: str, x_admin_key: Optional[str] = Header(None)):
     verify_admin(x_admin_key)
-    res = extract_article(payload.url)
-    if not res["success"]:
-        return ExtractionDebugResponse(
-            resolved_url=res.get("resolved_url", payload.url),
-            canonical_url=None,
-            source_name="Unknown",
-            title="Failed",
-            image_url=None,
-            published_at=None,
-            content_length=0,
-            image_valid=False,
-            status=f"error: {res.get('error')}"
-        )
+    news_col = get_news_collection()
+    sources_col = get_sources_collection()
+    revisions_col = get_revisions_collection()
 
-    return ExtractionDebugResponse(
-        resolved_url=res["resolved_url"],
-        canonical_url=res.get("canonical_url"),
-        source_name=res["publisher_name"],
-        title=res["title"],
-        image_url=res.get("image_url"),
-        published_at=res.get("published_at"),
-        content_length=len(res.get("body", "") or ""),
-        image_valid=bool(res.get("image_url")),
-        status="ok"
+    doc = news_col.find_one({"$or": [{"slug": identifier}, {"_id": identifier}]})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Article not found")
+
+    art_id = str(doc["_id"])
+    sources = list(sources_col.find({"article_id": art_id}))
+    revisions = list(revisions_col.find({"article_id": art_id}))
+
+    source_items = []
+    extracted_facts = {}
+    for s in sources:
+        source_items.append(SourceProvenanceItem(
+            source_name=s.get("source_name", "Unknown"),
+            source_domain=s.get("source_domain", ""),
+            source_url=s.get("source_url", ""),
+            canonical_source_url=s.get("canonical_source_url"),
+            retrieved_at=s.get("retrieved_at", ""),
+            published_at=s.get("published_at"),
+            source_type=s.get("source_type", "rss_ingest"),
+            source_hash=s.get("source_hash"),
+            verification_status=s.get("verification_status", "verified")
+        ))
+        if s.get("extracted_facts"):
+            extracted_facts = s["extracted_facts"]
+
+    for r in revisions:
+        r["_id"] = str(r["_id"])
+
+    return ArticleProvenanceResponse(
+        article_id=art_id,
+        slug=doc["slug"],
+        title=doc["title"],
+        author=doc.get("author", config.DEFAULT_AUTHOR),
+        published_at=doc.get("published_at", ""),
+        quality_score=doc.get("quality_score", 80),
+        fact_check_status=doc.get("fact_check_status", "passed"),
+        originality_status=doc.get("originality_status", "verified_original"),
+        sources=source_items,
+        extracted_facts=extracted_facts,
+        revisions=revisions
     )
 
 @app.post("/api/admin/scrape-now", tags=["Admin"])
 def trigger_manual_scrape(x_admin_key: Optional[str] = Header(None)):
     verify_admin(x_admin_key)
     res = run_news_scraper()
-    return {"message": "Scrape operation completed", "result": res}
+    return {"message": "Editorial ingestion run complete", "result": res}
 
 @app.get("/api/admin/stats", response_model=AdminStatsResponse, tags=["Admin"])
 def get_admin_metrics(x_admin_key: Optional[str] = Header(None)):
@@ -338,6 +373,29 @@ def get_admin_metrics(x_admin_key: Optional[str] = Header(None)):
         articles_skipped=scraper_stats.get("articles_skipped", 0),
         category_counts=category_counts
     )
+
+@app.get("/sitemap.xml", response_class=PlainResponse, tags=["SEO"])
+def get_main_sitemap():
+    col = get_news_collection()
+    if col is None:
+        return PlainResponse("<urlset xmlns='http://www.sitemaps.org/schemas/sitemap/0.9'></urlset>", media_type="application/xml")
+
+    articles = list(col.find({"content_status": "published"}).sort("published_at", -1).limit(100))
+    xml_lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
+        f'  <url><loc>{config.FRONTEND_URL}</loc><changefreq>always</changefreq><priority>1.0</priority></url>'
+    ]
+
+    for cat in config.CONTROLLED_CATEGORIES:
+        xml_lines.append(f'  <url><loc>{config.FRONTEND_URL}/category/{cat}</loc><changefreq>hourly</changefreq><priority>0.8</priority></url>')
+
+    for a in articles:
+        slug = xml.sax.saxutils.escape(a.get("slug", ""))
+        xml_lines.append(f'  <url><loc>{config.FRONTEND_URL}/news/{slug}</loc><changefreq>never</changefreq><priority>0.9</priority></url>')
+
+    xml_lines.append('</urlset>')
+    return PlainResponse("\n".join(xml_lines), media_type="application/xml")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))

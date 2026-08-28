@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Service URLs
+# URLs
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://tezkhabar-frontend.onrender.com").rstrip("/")
 BACKEND_URL = os.getenv("BACKEND_URL", "https://tezkhabar.onrender.com").rstrip("/")
 
@@ -12,6 +12,8 @@ BACKEND_URL = os.getenv("BACKEND_URL", "https://tezkhabar.onrender.com").rstrip(
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "tezkhabar_db")
 MONGO_COLLECTION_NAME = os.getenv("MONGO_COLLECTION_NAME", "news_posts")
+MONGO_SOURCES_COLLECTION = os.getenv("MONGO_SOURCES_COLLECTION", "article_sources")
+MONGO_REVISIONS_COLLECTION = os.getenv("MONGO_REVISIONS_COLLECTION", "article_revisions")
 
 # AI Engine
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
@@ -21,10 +23,16 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "tezkhabar-secret-admin-key-2026")
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON", "")
 
-# Scraper Settings
+# Ingestion Settings
 SCRAPER_INTERVAL_SECONDS = int(os.getenv("SCRAPER_INTERVAL_SECONDS", "600"))
-MAX_ARTICLES_PER_FEED = int(os.getenv("MAX_ARTICLES_PER_FEED", "12"))
+MAX_ARTICLES_PER_FEED = int(os.getenv("MAX_ARTICLES_PER_FEED", "10"))
 REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "8"))
+MIN_QUALITY_SCORE = int(os.getenv("MIN_QUALITY_SCORE", "65"))
+
+# Editorial Attribution Policy: "none" | "based_on_multiple_reports" | "source_names"
+PUBLIC_ATTRIBUTION_STYLE = os.getenv("PUBLIC_ATTRIBUTION_STYLE", "based_on_multiple_reports")
+DEFAULT_AUTHOR = "TezKhabar Editorial Desk"
+DEFAULT_PUBLISHER = "TezKhabar"
 
 # Controlled Categories
 CONTROLLED_CATEGORIES = [
@@ -43,7 +51,6 @@ CONTROLLED_CATEGORIES = [
     "startups",
     "automobile",
     "world",
-    "lifestyle",
     "science",
     "health"
 ]
@@ -87,7 +94,7 @@ DOMAIN_PUBLISHER_MAP: Dict[str, str] = {
     "barandbench.com": "Bar and Bench",
 }
 
-# CORS Production Origins
+# Production CORS
 ALLOWED_ORIGINS: List[str] = [
     "https://tezkhabar-frontend.onrender.com",
     "http://localhost:3000",

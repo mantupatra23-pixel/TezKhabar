@@ -1,51 +1,44 @@
 from typing import List, Optional, Any, Dict
 from pydantic import BaseModel, Field
 
-class NewsSourceItem(BaseModel):
-    name: str
-    url: Optional[str] = None
-    published_at: Optional[str] = None
-    domain: Optional[str] = None
-    stance: Optional[str] = None
-
-class ArticleDocument(BaseModel):
-    id: Optional[str] = None
+# ==========================================
+# PUBLIC EDITORIAL SCHEMAS (Frontend Consumed)
+# ==========================================
+class PublicArticleItem(BaseModel):
+    id: str
     slug: str
     title: str
-    dek: str = ""
-    summary: str = ""
-    description: str = ""
+    dek: str
+    summary: str
+    description: str
     content: Optional[str] = None
-    source_content: Optional[str] = None
-    category: str = "india"
+    body: Optional[str] = None
+    category: str
     subcategory: Optional[str] = "India"
     badge: Optional[str] = None
     image: Optional[str] = None
     image_url: Optional[str] = None
-    source: str = "TezKhabar Wire"
-    source_name: str = "TezKhabar Wire"
-    source_url: str = "#"
-    source_domain: Optional[str] = None
-    author: Optional[str] = None
-    published_at: Optional[str] = None
+    imageUrl: Optional[str] = None
+    image_source_type: str = "editorial"
+    image_credit: Optional[str] = None
+    author: str = "TezKhabar Editorial Desk"
+    publisher: str = "TezKhabar"
+    source: str = "TezKhabar Editorial Desk"
+    source_name: str = "TezKhabar Editorial Desk"
+    published_at: str
+    publishedAt: str
     updated_at: Optional[str] = None
+    updatedAt: Optional[str] = None
     created_at: str
-    language: str = "en"
-    region: str = "IN"
-    story_cluster_id: Optional[str] = None
-    source_count: int = 1
-    sources: List[NewsSourceItem] = []
-    key_facts: List[str] = []
-    why_it_matters: Optional[str] = None
-    timeline: List[dict] = []
-    ai_summary: Optional[str] = None
-    ai_generated: bool = False
-    ai_status: str = "skipped"
-    content_status: str = "published"
-    confidence: str = "developing"
-    canonical_source_url: Optional[str] = None
+    createdAt: str
     canonical_url: str
+    key_facts: List[str] = []
+    keyFacts: List[str] = []
+    key_highlights: List[str] = []
+    why_it_matters: Optional[str] = None
+    attribution: Optional[str] = None
     word_count: int = 0
+    confidence: str = "verified"
 
 class PaginationMetadata(BaseModel):
     page: int
@@ -53,17 +46,44 @@ class PaginationMetadata(BaseModel):
     total: int
     has_next: bool
 
-class NewsListResponse(BaseModel):
-    items: List[ArticleDocument]
+class PublicNewsListResponse(BaseModel):
+    items: List[PublicArticleItem]
     pagination: PaginationMetadata
 
-class SingleArticleResponse(BaseModel):
-    article: ArticleDocument
+class PublicSingleArticleResponse(BaseModel):
+    article: PublicArticleItem
 
 class CategoryCountItem(BaseModel):
     name: str
     slug: str
     count: int
+
+# ==========================================
+# PRIVATE PROVENANCE / AUDIT SCHEMAS
+# ==========================================
+class SourceProvenanceItem(BaseModel):
+    source_name: str
+    source_domain: str
+    source_url: str
+    canonical_source_url: Optional[str] = None
+    retrieved_at: str
+    published_at: Optional[str] = None
+    source_type: str = "rss_ingest"
+    source_hash: Optional[str] = None
+    verification_status: str = "verified"
+
+class ArticleProvenanceResponse(BaseModel):
+    article_id: str
+    slug: str
+    title: str
+    author: str
+    published_at: str
+    quality_score: int
+    fact_check_status: str
+    originality_status: str
+    sources: List[SourceProvenanceItem]
+    extracted_facts: Dict[str, Any]
+    revisions: List[Dict[str, Any]]
 
 class AdminStatsResponse(BaseModel):
     total_articles: int
@@ -76,17 +96,3 @@ class AdminStatsResponse(BaseModel):
     articles_saved: int
     articles_skipped: int
     category_counts: List[dict]
-
-class ExtractionDebugRequest(BaseModel):
-    url: str
-
-class ExtractionDebugResponse(BaseModel):
-    resolved_url: str
-    canonical_url: Optional[str] = None
-    source_name: str
-    title: str
-    image_url: Optional[str] = None
-    published_at: Optional[str] = None
-    content_length: int
-    image_valid: bool
-    status: str
