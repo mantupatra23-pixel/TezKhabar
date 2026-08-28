@@ -4,7 +4,7 @@ from pymongo import MongoClient, ASCENDING, DESCENDING
 from pymongo.collection import Collection
 from pymongo.database import Database
 import config
-from extractor import strip_html_tags, is_valid_article_image
+from extractor import FORBIDDEN_TITLES, is_valid_news_title, strip_html_tags, validate_and_normalize_image
 
 logger = logging.getLogger("tezkhabar.db")
 
@@ -36,75 +36,63 @@ def get_news_collection() -> Collection:
         _news_collection = db_instance[config.MONGO_COLLECTION_NAME]
     return _news_collection
 
-def normalize_slug_string(text: str) -> str:
-    cleaned = re.sub(r"[^\w\s-]", "", text).lower().strip()
-    return re.sub(r"[-\s]+", "-", cleaned)[:90].rstrip("-")
-
-def migrate_and_clean_existing_documents():
+def cleanup_invalid_google_news_records():
     """
-    Normalizes existing records without deleting any document.
+    Purges/rejects Google News feed wrapper records and strips generic placeholder images.
     """
     try:
         col = get_news_collection()
-        cursor = col.find({})
-        updated_count = 0
-        seen_slugs = set()
+        
+        # 1. Reject records with generic feed titles
+        for title in FORBIDDEN_TITLES:
+            col.update_many(
+                {"title": {"$regex": f"^{re.escape(title)}$", "$options": "i"}},
+                {"$set": {"content_status": "rejected"}}
+            )
 
+        # 2. Reject records where source is generic feed and title is invalid
+        col.update_many(
+            {
+                "$or": [
+                    {"title": {"$regex": "^Google News", "$options": "i"}},
+                    {"title": {"$regex": "Google News$", "$options": "i"}},
+                ],
+                "content_status": "published"
+            },
+            {"$set": {"content_status": "rejected"}}
+        )
+
+        # 3. Clean remaining valid records
+        cursor = col.find({"content_status": "published"})
         for doc in cursor:
-            doc_id = doc["_id"]
-            title = doc.get("title", "News Story")
-            raw_slug = doc.get("slug")
-            
-            # Generate valid slug if missing
-            if not raw_slug or not str(raw_slug).strip():
-                base_slug = normalize_slug_string(title) or f"story-{str(doc_id)[:8]}"
-            else:
-                base_slug = normalize_slug_string(str(raw_slug))
+            title = doc.get("title", "")
+            if not is_valid_news_title(title):
+                col.update_one({"_id": doc["_id"]}, {"$set": {"content_status": "rejected"}})
+                continue
 
-            # Ensure uniqueness
-            slug = base_slug
-            idx = 2
-            while slug in seen_slugs:
-                slug = f"{base_slug}-{idx}"
-                idx += 1
-            seen_slugs.add(slug)
-
-            # Clean raw HTML from dek / summary
-            clean_summary = strip_html_tags(doc.get("summary") or doc.get("dek") or title)
-            clean_dek = strip_html_tags(doc.get("dek") or clean_summary[:140])
-
-            # Validate image
             raw_img = doc.get("image_url") or doc.get("image")
-            image_url = raw_img if is_valid_article_image(raw_img) else None
+            valid_img = validate_and_normalize_image(raw_img)
 
-            # Fix source name if it says Google News
             source_name = doc.get("source_name") or doc.get("source") or "TezKhabar Wire"
-            if source_name.lower() == "google news" and doc.get("source_domain"):
-                source_name = doc.get("source_domain").replace("www.", "")
+            if source_name.lower().startswith("google news"):
+                source_name = doc.get("source_domain", "TezKhabar Wire").replace("www.", "")
 
             col.update_one(
-                {"_id": doc_id},
+                {"_id": doc["_id"]},
                 {
                     "$set": {
-                        "slug": slug,
-                        "title": strip_html_tags(title),
-                        "summary": clean_summary,
-                        "description": clean_summary,
-                        "dek": clean_dek,
-                        "image": image_url,
-                        "image_url": image_url,
+                        "image": valid_img,
+                        "image_url": valid_img,
                         "source": source_name,
                         "source_name": source_name,
-                        "content_status": "published",
-                        "canonical_url": f"{config.FRONTEND_URL}/news/{slug}"
                     }
                 }
             )
-            updated_count += 1
 
-        logger.info(f"[DB Migration] Successfully verified and normalized {updated_count} articles.")
+        valid_count = col.count_documents({"content_status": "published"})
+        logger.info(f"[DB Cleanup] Completed. Verified published articles in database: {valid_count}")
     except Exception as e:
-        logger.error(f"[DB Migration Error]: {e}")
+        logger.error(f"[DB Cleanup Error]: {e}")
 
 def init_db() -> bool:
     try:
@@ -112,19 +100,14 @@ def init_db() -> bool:
         client.admin.command("ping")
         col = get_news_collection()
         
-        # Run safe normalization first
-        migrate_and_clean_existing_documents()
-
-        # Create indexes
         col.create_index([("slug", ASCENDING)], unique=True, background=True)
         col.create_index([("source_url", ASCENDING)], unique=True, background=True)
+        col.create_index([("canonical_source_url", ASCENDING)], background=True)
         col.create_index([("published_at", DESCENDING)], background=True)
-        col.create_index([("created_at", DESCENDING)], background=True)
         col.create_index([("category", ASCENDING), ("published_at", DESCENDING)], background=True)
         col.create_index([("content_status", ASCENDING)], background=True)
-        
-        count = col.count_documents({})
-        logger.info(f"[DB] Connected to MongoDB. Database: '{config.MONGO_DB_NAME}', Verified Articles: {count}")
+
+        cleanup_invalid_google_news_records()
         return True
     except Exception as e:
         logger.error(f"[DB] MongoDB initialization warning: {e}")

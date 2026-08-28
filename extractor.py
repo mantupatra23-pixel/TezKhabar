@@ -1,8 +1,10 @@
 import re
 import html
+import json
 import socket
 import ipaddress
 import urllib.parse
+from typing import Optional, Tuple, Dict, Any
 import requests
 from bs4 import BeautifulSoup
 import config
@@ -19,6 +21,19 @@ SSRF_BLOCKED_NETWORKS = [
     ipaddress.ip_network("fe80::/10"),
 ]
 
+FORBIDDEN_TITLES = {
+    "google news",
+    "google news politics",
+    "google news business",
+    "google news technology",
+    "google news sports",
+    "google news india",
+    "google news finance",
+    "google news entertainment",
+    "google news ai",
+    "google news world",
+}
+
 GENERIC_IMAGE_PATTERNS = [
     "lh3.googleusercontent.com",
     "gstatic.com",
@@ -33,8 +48,16 @@ GENERIC_IMAGE_PATTERNS = [
     "logo_google",
     "feed-icon",
     "icon.png",
-    "spacer.gif"
+    "spacer.gif",
+    "avatar",
+    "share-icon"
 ]
+
+HTTP_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 TezKhabarEditorial/6.1",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9,hi;q=0.8",
+}
 
 def is_safe_url(url: str) -> bool:
     try:
@@ -44,7 +67,6 @@ def is_safe_url(url: str) -> bool:
         hostname = parsed.hostname
         if not hostname or hostname in ("localhost", "127.0.0.1", "0.0.0.0"):
             return False
-        
         ip_str = socket.gethostbyname(hostname)
         ip = ipaddress.ip_address(ip_str)
         for blocked in SSRF_BLOCKED_NETWORKS:
@@ -54,178 +76,243 @@ def is_safe_url(url: str) -> bool:
     except Exception:
         return False
 
-def is_valid_article_image(url: Optional[str] = None) -> bool:
-    if not url or not isinstance(url, str):
-        return False
-    if not url.startswith("http"):
-        return False
-    
-    lower_url = url.lower()
-    for pattern in GENERIC_IMAGE_PATTERNS:
-        if pattern in lower_url:
-            return False
-            
-    # Check for image file extension or standard CDN image delivery
-    valid_extensions = (".jpg", ".jpeg", ".png", ".webp", ".avif")
-    path = urllib.parse.urlparse(url).path.lower()
-    if any(path.endswith(ext) for ext in valid_extensions) or "image" in lower_url or "img" in lower_url or "photo" in lower_url:
-        return True
-
-    return True
-
 def strip_html_tags(raw_html: str = "") -> str:
     if not raw_html:
         return ""
-    # Strip HTML tags
-    clean = re.sub(r"<[^>]*>", " ", raw_html)
-    # Unescape HTML entities (&nbsp;, &amp;, etc.)
+    clean = re.sub(r"<[^>]*>", " ", str(raw_html))
     clean = html.unescape(clean)
-    # Collapse multiple whitespaces
     return re.sub(r"\s+", " ", clean).strip()
 
-def clean_source_url(url: str) -> str:
+def is_valid_news_title(title: str) -> bool:
+    if not title or len(title.strip()) < 10:
+        return False
+    clean = title.strip().lower()
+    if clean in FORBIDDEN_TITLES:
+        return False
+    if clean.startswith("google news") and len(clean.split()) <= 4:
+        return False
+    return True
+
+def resolve_publisher_url(source_url: str) -> str:
+    """
+    Follows Google News wrapper redirects to uncover the real publisher URL.
+    """
+    if "news.google.com" not in source_url:
+        return source_url
+    if not is_safe_url(source_url):
+        return source_url
+
     try:
-        parsed = urllib.parse.urlparse(url)
-        clean_qs = []
-        for k, v in urllib.parse.parse_qsl(parsed.query):
-            if not k.startswith("utm_") and k not in ("fbclid", "gclid", "ref", "oc"):
-                clean_qs.append((k, v))
-        new_query = urllib.parse.urlencode(clean_qs)
-        return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, ""))
+        session = requests.Session()
+        session.max_redirects = 5
+        resp = session.get(source_url, headers=HTTP_HEADERS, timeout=6, allow_redirects=True)
+        final_url = resp.url
+        if "news.google.com" not in final_url:
+            return final_url
+
+        # Check page source for canonical or direct publisher redirects
+        soup = BeautifulSoup(resp.content, "html.parser")
+        canonical = soup.find("link", rel="canonical")
+        if canonical and canonical.get("href") and "news.google.com" not in canonical["href"]:
+            return canonical["href"]
+
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if href.startswith("http") and "google.com" not in href:
+                return href
+
+        return final_url
     except Exception:
-        return url
+        return source_url
 
-def parse_rss_title_and_source(raw_title: str, default_source: str = "TezKhabar Wire") -> tuple[str, str]:
+def validate_and_normalize_image(image_url: Optional[str], base_url: str = "") -> Optional[str]:
     """
-    Google News format: 'Headline of the Story - Publisher Name'
-    Extracts clean headline and real publisher.
+    Validates image via HTTP HEAD/GET, checking Content-Type and dimensions.
+    Rejects generic Google News icons, tracking pixels, and broken links.
     """
-    clean_title = strip_html_tags(raw_title)
-    if " - " in clean_title:
-        parts = clean_title.rsplit(" - ", 1)
-        headline = parts[0].strip()
-        publisher = parts[1].strip()
-        if len(publisher) >= 2 and publisher.lower() != "google news":
-            return headline, publisher
-    return clean_title, default_source
+    if not image_url or not isinstance(image_url, str):
+        return None
 
-def extract_image_from_entry(entry: Any) -> Optional[str]:
-    # 1. Media content
-    if hasattr(entry, "media_content") and entry.media_content:
-        for media in entry.media_content:
-            url = media.get("url")
-            if is_valid_article_image(url):
-                return url
+    # Resolve relative & protocol-relative URLs
+    clean_url = urllib.parse.urljoin(base_url, image_url.strip())
+    if clean_url.startswith("//"):
+        clean_url = "https:" + clean_url
 
-    # 2. Media thumbnail
-    if hasattr(entry, "media_thumbnail") and entry.media_thumbnail:
-        for media in entry.media_thumbnail:
-            url = media.get("url")
-            if is_valid_article_image(url):
-                return url
+    if not clean_url.startswith(("http://", "https://")):
+        return None
 
-    # 3. Enclosures
-    if hasattr(entry, "enclosures") and entry.enclosures:
-        for enc in entry.enclosures:
-            url = enc.get("href")
-            if is_valid_article_image(url):
-                return url
+    lower_url = clean_url.lower()
+    for pattern in GENERIC_IMAGE_PATTERNS:
+        if pattern in lower_url:
+            return None
 
-    # 4. Images inside content / summary HTML
-    html_content = ""
-    if hasattr(entry, "content") and entry.content:
-        html_content = entry.content[0].get("value", "")
-    elif hasattr(entry, "summary"):
-        html_content = entry.summary or ""
-
-    if html_content:
-        soup = BeautifulSoup(html_content, "html.parser")
-        for img in soup.find_all("img"):
-            src = img.get("src")
-            if is_valid_article_image(src):
-                return src
+    try:
+        resp = requests.head(clean_url, headers=HTTP_HEADERS, timeout=4, allow_redirects=True)
+        if resp.status_code == 200:
+            ct = resp.headers.get("Content-Type", "").lower()
+            if ct.startswith("image/") and "svg" not in ct:
+                cl = resp.headers.get("Content-Length")
+                if cl and int(cl) < 1500:  # Ignore 1x1 tracking pixels
+                    return None
+                return resp.url
+    except Exception:
+        pass
 
     return None
 
-def extract_article(url: str, fallback_title: str = "", fallback_summary: str = "") -> dict:
-    fallback_summary_clean = strip_html_tags(fallback_summary)
-    fallback_title_clean = strip_html_tags(fallback_title)
+def extract_json_ld(soup: BeautifulSoup) -> Dict[str, Any]:
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            if not script.string:
+                continue
+            data = json.loads(script.string)
+            items = data if isinstance(data, list) else data.get("@graph", [data])
+            for item in items:
+                if isinstance(item, dict) and item.get("@type") in ("NewsArticle", "Article", "ReportageNewsArticle"):
+                    return item
+        except Exception:
+            continue
+    return {}
 
-    if not is_safe_url(url):
-        return {
-            "success": True if len(fallback_summary_clean.split()) >= 10 else False,
-            "title": fallback_title_clean,
-            "description": fallback_summary_clean,
-            "body": fallback_summary_clean,
-            "image_url": None,
-            "published_at": None,
-            "author": None,
-            "word_count": len(fallback_summary_clean.split()),
-        }
+def extract_article(target_url: str, fallback_title: str = "", fallback_summary: str = "") -> Dict[str, Any]:
+    """
+    Fetches real publisher article, extracts JSON-LD, OpenGraph, Twitter, and sanitized content.
+    """
+    real_url = resolve_publisher_url(target_url)
+    domain = urllib.parse.urlparse(real_url).netloc.replace("www.", "")
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 TezKhabarEditorial/6.0",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    }
+    if not is_safe_url(real_url):
+        return {"success": False, "error": "SSRF_BLOCKED"}
 
     try:
-        resp = requests.get(url, headers=headers, timeout=5, allow_redirects=True)
+        resp = requests.get(real_url, headers=HTTP_HEADERS, timeout=config.REQUEST_TIMEOUT_SECONDS, allow_redirects=True)
         if resp.status_code >= 400:
-            return {
-                "success": True if len(fallback_summary_clean.split()) >= 10 else False,
-                "title": fallback_title_clean,
-                "description": fallback_summary_clean,
-                "body": fallback_summary_clean,
-                "image_url": None,
-                "published_at": None,
-                "author": None,
-                "word_count": len(fallback_summary_clean.split()),
-            }
+            return {"success": False, "error": f"HTTP_{resp.status_code}"}
 
         soup = BeautifulSoup(resp.content, "html.parser")
+        json_ld = extract_json_ld(soup)
 
+        # 1. Title Extraction Priority: og:title -> json_ld headline -> title tag -> fallback
         og_title = soup.find("meta", property="og:title")
-        og_desc = soup.find("meta", property="og:description")
-        og_img = soup.find("meta", property="og:image") or soup.find("meta", {"name": "twitter:image"})
-        meta_pub = soup.find("meta", property="article:published_time") or soup.find("meta", {"name": "pubdate"})
-        meta_author = soup.find("meta", {"name": "author"})
+        tw_title = soup.find("meta", {"name": "twitter:title"})
+        title_tag = soup.title.string.strip() if soup.title and soup.title.string else ""
 
-        title = og_title["content"].strip() if og_title and og_title.get("content") else (soup.title.string.strip() if soup.title and soup.title.string else fallback_title_clean)
-        description = og_desc["content"].strip() if og_desc and og_desc.get("content") else fallback_summary_clean
+        extracted_title = ""
+        if og_title and og_title.get("content"):
+            extracted_title = og_title["content"].strip()
+        elif json_ld.get("headline"):
+            extracted_title = str(json_ld["headline"]).strip()
+        elif tw_title and tw_title.get("content"):
+            extracted_title = tw_title["content"].strip()
+        elif title_tag:
+            extracted_title = title_tag
+        else:
+            extracted_title = fallback_title
+
+        extracted_title = strip_html_tags(extracted_title)
+        if " - " in extracted_title:
+            parts = extracted_title.rsplit(" - ", 1)
+            if len(parts[0]) > 10:
+                extracted_title = parts[0].strip()
+
+        if not is_valid_news_title(extracted_title):
+            return {"success": False, "error": "INVALID_ARTICLE_TITLE"}
+
+        # 2. Publisher / Source Name Priority: JSON-LD publisher -> og:site_name -> Domain Name
+        publisher_name = ""
+        if isinstance(json_ld.get("publisher"), dict) and json_ld["publisher"].get("name"):
+            publisher_name = str(json_ld["publisher"]["name"]).strip()
+        elif soup.find("meta", property="og:site_name"):
+            publisher_name = soup.find("meta", property="og:site_name").get("content", "").strip()
         
-        extracted_img = og_img["content"].strip() if og_img and og_img.get("content") else None
-        valid_img = extracted_img if is_valid_article_image(extracted_img) else None
+        if not publisher_name or publisher_name.lower() in FORBIDDEN_TITLES:
+            publisher_name = domain.split(".")[0].upper() if domain else "TezKhabar Wire"
 
-        published_at = meta_pub["content"].strip() if meta_pub and meta_pub.get("content") else None
-        author = meta_author["content"].strip() if meta_author and meta_author.get("content") else None
+        # 3. Image Extraction Priority: JSON-LD image -> og:image -> twitter:image -> article img
+        extracted_img = None
+        if json_ld.get("image"):
+            img_val = json_ld["image"]
+            if isinstance(img_val, list) and len(img_val) > 0:
+                extracted_img = img_val[0] if isinstance(img_val[0], str) else img_val[0].get("url")
+            elif isinstance(img_val, dict):
+                extracted_img = img_val.get("url")
+            elif isinstance(img_val, str):
+                extracted_img = img_val
 
-        for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form", "iframe", "noscript"]):
+        if not extracted_img:
+            og_img = soup.find("meta", property="og:image")
+            if og_img and og_img.get("content"):
+                extracted_img = og_img["content"]
+
+        if not extracted_img:
+            tw_img = soup.find("meta", {"name": "twitter:image"})
+            if tw_img and tw_img.get("content"):
+                extracted_img = tw_img["content"]
+
+        if not extracted_img:
+            art_img = soup.find("article")
+            if art_img:
+                img_tag = art_img.find("img")
+                if img_tag and img_tag.get("src"):
+                    extracted_img = img_tag["src"]
+
+        valid_image_url = validate_and_normalize_image(extracted_img, base_url=real_url)
+
+        # 4. Description / Summary
+        og_desc = soup.find("meta", property="og:description")
+        meta_desc = soup.find("meta", {"name": "description"})
+        extracted_desc = ""
+        if og_desc and og_desc.get("content"):
+            extracted_desc = og_desc["content"].strip()
+        elif json_ld.get("description"):
+            extracted_desc = str(json_ld["description"]).strip()
+        elif meta_desc and meta_desc.get("content"):
+            extracted_desc = meta_desc["content"].strip()
+        else:
+            extracted_desc = fallback_summary
+
+        extracted_desc = strip_html_tags(extracted_desc)
+
+        # 5. Clean Article Body
+        for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form", "iframe", "noscript", "svg"]):
             tag.decompose()
 
-        paragraphs = [p.get_text().strip() for p in soup.find_all("p") if len(p.get_text().strip()) > 35]
-        body_text = " ".join(paragraphs) if paragraphs else description
+        article_container = soup.find("article") or soup.find("main") or soup
+        paragraphs = []
+        for p in article_container.find_all("p"):
+            text = strip_html_tags(p.get_text())
+            if len(text) > 35 and not any(junk in text.lower() for junk in ["subscribe", "cookie policy", "terms of use", "all rights reserved", "click here", "sign up"]):
+                paragraphs.append(text)
 
-        if len(body_text.split()) < 15 and len(fallback_summary_clean.split()) >= 15:
-            body_text = fallback_summary_clean
+        body_text = " ".join(paragraphs) if paragraphs else extracted_desc
+        if len(body_text.split()) < 20 and len(extracted_desc.split()) >= 15:
+            body_text = extracted_desc
+
+        if len(body_text.split()) < 15:
+            return {"success": False, "error": "CONTENT_INSUFFICIENT"}
+
+        # 6. Dates
+        meta_pub = soup.find("meta", property="article:published_time") or soup.find("meta", {"name": "pubdate"})
+        published_at = None
+        if json_ld.get("datePublished"):
+            published_at = str(json_ld["datePublished"])
+        elif meta_pub and meta_pub.get("content"):
+            published_at = meta_pub["content"]
+
+        author = json_ld.get("author", {}).get("name") if isinstance(json_ld.get("author"), dict) else None
 
         return {
             "success": True,
-            "title": strip_html_tags(title or fallback_title_clean),
-            "description": strip_html_tags(description or body_text[:200]),
-            "body": strip_html_tags(body_text[:3500]),
-            "image_url": valid_img,
+            "title": extracted_title,
+            "description": extracted_desc or body_text[:240],
+            "body": body_text[:4000],
+            "image_url": valid_image_url,
+            "publisher_name": publisher_name,
+            "resolved_url": real_url,
+            "source_domain": domain,
             "published_at": published_at,
-            "author": author,
+            "author": author or publisher_name,
             "word_count": len(body_text.split()),
         }
-    except Exception:
-        return {
-            "success": True if len(fallback_summary_clean.split()) >= 10 else False,
-            "title": fallback_title_clean,
-            "description": fallback_summary_clean,
-            "body": fallback_summary_clean,
-            "image_url": None,
-            "published_at": None,
-            "author": None,
-            "word_count": len(fallback_summary_clean.split()),
-        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}

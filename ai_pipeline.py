@@ -4,38 +4,14 @@ import logging
 import unicodedata
 from groq import Groq
 import config
+from extractor import strip_html_tags, is_valid_news_title
 
 logger = logging.getLogger("tezkhabar.ai")
-
 groq_client = None
-active_model = config.GROQ_MODEL
-
-FALLBACK_MODELS = [
-    config.GROQ_MODEL,
-    "llama-3.1-8b-instant",
-    "llama-3.3-70b-versatile",
-    "llama-3.1-70b-versatile",
-    "llama3-70b-8192",
-    "llama3-8b-8192",
-    "gemma2-9b-it",
-    "mixtral-8x7b-32768"
-]
 
 if config.GROQ_API_KEY:
     try:
         groq_client = Groq(api_key=config.GROQ_API_KEY)
-        # Verify model availability
-        try:
-            available_models = [m.id for m in groq_client.models.list().data]
-            logger.info(f"[AI] Connected to Groq. Available models: {len(available_models)}")
-            if active_model not in available_models:
-                for candidate in FALLBACK_MODELS:
-                    if candidate in available_models:
-                        active_model = candidate
-                        logger.info(f"[AI] Switching to verified active model: {active_model}")
-                        break
-        except Exception as e:
-            logger.warning(f"[AI] Model list verification skipped: {e}")
     except Exception as e:
         logger.error(f"[AI] Groq client initialization error: {e}")
 
@@ -60,21 +36,19 @@ def generate_cluster_id(title: str, category: str) -> str:
     common_stopwords = {"the", "and", "for", "that", "this", "with", "from", "have", "india", "news", "report"}
     key_words = [w for w in words if w not in common_stopwords]
     key_words.sort()
-    signature = "-".join(key_words[:4]) if key_words else "general-cluster"
+    signature = "-".join(key_words[:4]) if key_words else "cluster"
     return f"{category}-{signature}"
 
 def process_article_with_ai(title: str, raw_text: str, source_name: str, feed_cat: str) -> dict:
     normalized_cat = normalize_category(feed_cat)
-    cleaned_desc = raw_text.strip()[:300] if raw_text else title
+    clean_summary = strip_html_tags(raw_text)[:300] if raw_text else title
     
-    # Safe deterministic metadata fallback
     fallback_result = {
-        "title": title,
-        "dek": cleaned_desc[:140],
-        "summary": cleaned_desc,
+        "dek": clean_summary[:140],
+        "summary": clean_summary,
         "category": normalized_cat,
         "subcategory": "India",
-        "content": f"<p>{raw_text[:800] if raw_text else title}</p>",
+        "content": f"<p>{raw_text[:800]}</p>",
         "key_facts": [title],
         "why_it_matters": f"Reported by {source_name} regarding ongoing developments.",
         "ai_generated": False,
@@ -84,7 +58,7 @@ def process_article_with_ai(title: str, raw_text: str, source_name: str, feed_ca
     if not groq_client:
         return fallback_result
 
-    prompt = f"""You are a senior editorial news summarization assistant for an Indian news publication.
+    prompt = f"""You are a senior editorial news assistant for TezKhabar.
 Summarize this news report strictly and factually.
 RULES:
 1. Never invent facts, quotes, statistics, dates, or names.
@@ -92,7 +66,6 @@ RULES:
 3. Output valid JSON only matching this schema:
 
 {{
-  "title": "Factual headline (concise, max 14 words)",
   "dek": "1 factual sentence explaining the core event",
   "summary": "2-3 clear factual sentences explaining context",
   "category": "{normalized_cat}",
@@ -103,12 +76,12 @@ RULES:
   "confidence": "developing"
 }}
 
-Source: {source_name}
+Publisher: {source_name}
 Title: {title}
-Article: {raw_text[:2500]}
+Article Body: {raw_text[:2500]}
 """
 
-    for model_name in [active_model] + [m for m in FALLBACK_MODELS if m != active_model]:
+    for model_name in [config.GROQ_MODEL, "llama-3.1-8b-instant", "llama3-70b-8192", "llama3-8b-8192"]:
         try:
             chat_completion = groq_client.chat.completions.create(
                 messages=[
@@ -118,7 +91,7 @@ Article: {raw_text[:2500]}
                 model=model_name,
                 response_format={"type": "json_object"},
                 temperature=0.1,
-                max_tokens=1000,
+                max_tokens=900,
             )
 
             content = chat_completion.choices[0].message.content
@@ -126,14 +99,7 @@ Article: {raw_text[:2500]}
             parsed["category"] = normalize_category(parsed.get("category", normalized_cat))
             parsed["ai_generated"] = True
             return parsed
-        except Exception as e:
-            err_msg = str(e)
-            if "404" in err_msg or "model_not_found" in err_msg:
-                logger.warning(f"[AI] Model {model_name} unavailable (404), testing fallback...")
-                continue
-            else:
-                logger.warning(f"[AI] Model {model_name} processing error: {e}")
-                break
+        except Exception:
+            continue
 
-    logger.info(f"[AI] Using safe metadata fallback for: '{title[:45]}...'")
     return fallback_result

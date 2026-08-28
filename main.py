@@ -33,22 +33,19 @@ logger = logging.getLogger("tezkhabar.main")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("[Startup] Connecting to MongoDB and verifying collections...")
+    logger.info("[Startup] Connecting to MongoDB and cleaning invalid records...")
     db_connected = init_db()
-    
     if db_connected:
         scraper_thread = threading.Thread(target=background_scraper_loop, daemon=True)
         scraper_thread.start()
         logger.info("[Startup] Background news ingestion worker started.")
-    else:
-        logger.warning("[Startup] Degraded mode: MongoDB connection pending.")
     yield
     logger.info("[Shutdown] Cleaning up services...")
 
 app = FastAPI(
     title="TezKhabar News Intelligence API",
     description="Production editorial news ingestion, clustering and article routing engine.",
-    version="6.1.0",
+    version="6.2.0",
     lifespan=lifespan
 )
 
@@ -93,7 +90,8 @@ def clean_doc(doc: dict) -> dict:
     doc["source"] = source_name
     doc["source_name"] = source_name
     doc["source_domain"] = doc.get("source_domain")
-    doc["source_url"] = str(doc.get("source_url") or "#")
+    doc["source_url"] = str(doc.get("source_url") or doc.get("canonical_source_url") or "#")
+    doc["canonical_source_url"] = doc.get("canonical_source_url") or doc["source_url"]
     doc["published_at"] = pub_date
     doc["created_at"] = str(doc.get("created_at") or pub_date)
     doc["canonical_url"] = str(doc.get("canonical_url") or f"{config.FRONTEND_URL}/news/{slug}")
@@ -106,15 +104,12 @@ def clean_doc(doc: dict) -> dict:
     doc["confidence"] = str(doc.get("confidence") or "developing")
     return doc
 
-# ==========================================
-# HEALTH & SERVICE STATUS
-# ==========================================
 @app.get("/", tags=["Health"])
 def root_info():
     return {
         "status": "ok",
         "service": "TezKhabar Backend Engine",
-        "version": "6.1.0",
+        "version": "6.2.0",
         "frontend": config.FRONTEND_URL,
         "database": get_db_health()
     }
@@ -128,12 +123,9 @@ def health_check():
         "status": "ok",
         "service": "tezkhabar-backend",
         "database": "connected",
-        "version": "6.1.0"
+        "version": "6.2.0"
     }
 
-# ==========================================
-# PUBLIC NEWS APIS
-# ==========================================
 @app.get("/api/news", response_model=NewsListResponse, tags=["News"])
 def get_news_list(
     category: Optional[str] = Query(None, description="Category filter"),
@@ -172,21 +164,16 @@ def lookup_article_by_slug(raw_slug: str):
     safe_slug = urllib.parse.unquote(raw_slug).strip().lower()
 
     try:
-        doc = col.find_one({"slug": safe_slug})
+        doc = col.find_one({"slug": safe_slug, "content_status": "published"})
         if not doc:
-            # Case-insensitive / ID fallback
-            doc = col.find_one({"slug": {"$regex": f"^{re.escape(safe_slug)}$", "$options": "i"}})
-        if not doc:
-            doc = col.find_one({"_id": safe_slug})
+            doc = col.find_one({"_id": safe_slug, "content_status": "published"})
     except Exception as e:
         logger.error(f"[Article Lookup Error] Slug '{safe_slug}': {e}")
         raise HTTPException(status_code=500, detail="Internal database error")
 
     if not doc:
-        logger.info(f"[ArticleAPI] 404 Not Found for slug: '{safe_slug}'")
         return JSONResponse(status_code=404, content={"detail": "Article not found", "slug": safe_slug})
 
-    logger.info(f"[ArticleAPI] Found article for slug: '{safe_slug}'")
     return {"article": ArticleDocument(**clean_doc(doc)).model_dump()}
 
 @app.get("/api/news/{slug}", tags=["News"])
@@ -226,6 +213,7 @@ def get_categories():
 
     try:
         pipeline = [
+            {"$match": {"content_status": "published"}},
             {"$group": {"_id": "$category", "count": {"$sum": 1}}},
             {"$sort": {"count": -1}}
         ]
@@ -285,8 +273,11 @@ def get_admin_metrics(x_admin_key: Optional[str] = Header(None)):
         raise HTTPException(status_code=503, detail="Database unavailable")
 
     try:
-        total_articles = col.count_documents({})
-        pipeline = [{"$group": {"_id": "$category", "count": {"$sum": 1}}}]
+        total_articles = col.count_documents({"content_status": "published"})
+        pipeline = [
+            {"$match": {"content_status": "published"}},
+            {"$group": {"_id": "$category", "count": {"$sum": 1}}}
+        ]
         category_counts = [{"category": r["_id"], "count": r["count"]} for r in col.aggregate(pipeline)]
     except Exception:
         total_articles = 0
@@ -304,57 +295,6 @@ def get_admin_metrics(x_admin_key: Optional[str] = Header(None)):
         articles_skipped=scraper_stats.get("articles_skipped", 0),
         category_counts=category_counts
     )
-
-@app.get("/sitemap.xml", response_class=PlainResponse, tags=["SEO"])
-def get_main_sitemap():
-    col = get_news_collection()
-    if col is None:
-        return PlainResponse("<urlset xmlns='http://www.sitemaps.org/schemas/sitemap/0.9'></urlset>", media_type="application/xml")
-
-    articles = list(col.find({"content_status": "published"}).sort("published_at", -1).limit(100))
-    xml_lines = [
-        '<?xml version="1.0" encoding="UTF-8"?>',
-        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
-        f'  <url><loc>{config.FRONTEND_URL}</loc><changefreq>always</changefreq><priority>1.0</priority></url>'
-    ]
-
-    for cat in config.CONTROLLED_CATEGORIES:
-        xml_lines.append(f'  <url><loc>{config.FRONTEND_URL}/category/{cat}</loc><changefreq>hourly</changefreq><priority>0.8</priority></url>')
-
-    for a in articles:
-        slug = xml.sax.saxutils.escape(a.get("slug", ""))
-        xml_lines.append(f'  <url><loc>{config.FRONTEND_URL}/news/{slug}</loc><changefreq>never</changefreq><priority>0.9</priority></url>')
-
-    xml_lines.append('</urlset>')
-    return PlainResponse("\n".join(xml_lines), media_type="application/xml")
-
-@app.get("/news-sitemap.xml", response_class=PlainResponse, tags=["SEO"])
-def get_news_sitemap():
-    col = get_news_collection()
-    if col is None:
-        return PlainResponse("<urlset xmlns='http://www.sitemaps.org/schemas/sitemap/0.9'></urlset>", media_type="application/xml")
-
-    articles = list(col.find({"content_status": "published"}).sort("published_at", -1).limit(50))
-    xml_lines = [
-        '<?xml version="1.0" encoding="UTF-8"?>',
-        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:news="http://www.google.com/schemas/sitemap-news/0.9">'
-    ]
-
-    for a in articles:
-        slug = xml.sax.saxutils.escape(a.get("slug", ""))
-        title = xml.sax.saxutils.escape(a.get("title", ""))
-        pub_date = a.get("published_at", datetime.now(timezone.utc).isoformat())
-        xml_lines.append('  <url>')
-        xml_lines.append(f'    <loc>{config.FRONTEND_URL}/news/{slug}</loc>')
-        xml_lines.append('    <news:news>')
-        xml_lines.append('      <news:publication><news:name>TezKhabar</news:name><news:language>en</news:language></news:publication>')
-        xml_lines.append(f'      <news:publication_date>{pub_date}</news:publication_date>')
-        xml_lines.append(f'      <news:title>{title}</news:title>')
-        xml_lines.append('    </news:news>')
-        xml_lines.append('  </url>')
-
-    xml_lines.append('</urlset>')
-    return PlainResponse("\n".join(xml_lines), media_type="application/xml")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
