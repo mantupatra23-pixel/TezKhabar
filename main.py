@@ -1,253 +1,303 @@
 import os
-import time
-import json
 import threading
-import xml.etree.ElementTree as ET
-from xml.dom import minidom
-import feedparser
-import requests
-from bs4 import BeautifulSoup
-from groq import Groq
-from pymongo import MongoClient
-from fastapi import FastAPI, Response
+import logging
+from typing import Optional
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+import xml.sax.saxutils
+
+from fastapi import FastAPI, HTTPException, Header, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
-from tenacity import retry, stop_after_attempt, wait_exponential
-from google.oauth2 import service_account
-from google.auth.transport.requests import AuthorizedSession
+from fastapi.responses import JSONResponse, Response as PlainResponse
 
-MONGO_URI = os.getenv("MONGO_URI")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON")  # Service Account JSON String
-RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "https://tezkhabar.onrender.com")
+import config
+from database import init_db, get_db_health, news_collection
+from schemas import (
+    NewsListResponse,
+    SingleArticleResponse,
+    CategoryCountItem,
+    AdminStatsResponse,
+    ArticleDocument,
+    PaginationMetadata,
+)
+from scraper import run_news_scraper, background_scraper_loop, scraper_stats
 
-app = FastAPI(title="TezKhabar Ultimate Master Engine v5.0")
-groq_client = Groq(api_key=GROQ_API_KEY)
+# Logging Configuration
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("tezkhabar.main")
 
-# --- DATABASE CONNECTION MONITOR ---
-try:
-    db_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-    db = db_client["tezkhabar_db"]
-    posts_collection = db["news_posts"]
-    db_client.server_info()
-    print("✅ MongoDB Connection Established Successfully!")
-except Exception as e:
-    print(f"❌ CRITICAL: MongoDB Connection Failed: {e}")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    logger.info("[Startup] Initializing TezKhabar Backend V6...")
+    init_db()
+    
+    # Start background scheduler thread safely
+    scraper_thread = threading.Thread(target=background_scraper_loop, daemon=True)
+    scraper_thread.start()
+    logger.info("[Startup] Background news ingestion worker initialized.")
+    yield
+    # Shutdown
+    logger.info("[Shutdown] Cleaning up TezKhabar services...")
 
+app = FastAPI(
+    title="TezKhabar News Intelligence API",
+    description="Production editorial news ingestion, clustering and summarization engine for Indian digital journalism.",
+    version="6.0.0",
+    lifespan=lifespan
+)
+
+# Strict Production CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=config.ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
-# --- INSTANT GOOGLE INDEXING ENGINE ---
-def push_to_google_instant_index(target_url):
-    """Fires a high-priority notify alert directly to Google Bots to index pages in minutes"""
-    try:
-        if not GOOGLE_CREDS_JSON:
-            print("⚠️ Google Indexing Alert: GOOGLE_CREDS_JSON variable missing. Skipping ping.")
-            return
-            
-        creds_info = json.loads(GOOGLE_CREDS_JSON)
-        scoped_creds = service_account.Credentials.from_service_account_info(
-            creds_info, 
-            scopes=["https://www.googleapis.com/auth/indexing"]
-        )
-        
-        authed_session = AuthorizedSession(scoped_creds)
-        endpoint = "https://indexing.googleapis.com/v3/urlNotifications:publish"
-        
-        payload = {
-            "url": target_url,
-            "type": "URL_UPDATED"
-        }
-        
-        response = authed_session.post(endpoint, json=payload, timeout=10)
-        if response.status_code == 200:
-            print(f"🔥 GOOGLE CRAWLER PINGED SUCCESSFULLY! Target URL is now Live-Queued: {target_url}")
-        else:
-            print(f"❌ Indexing API Refusal: {response.status_code} -> {response.text}")
-    except Exception as e:
-        print(f"❌ Webmaster Authorization Crash: {e}")
+# Security Headers Middleware
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    return response
 
-# --- CORE PARSING & CONTENT GENERATION SYSTEM ---
-def scrape_article_data(url):
-    try:
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-        r = requests.get(url, headers=headers, timeout=10)
-        soup = BeautifulSoup(r.content, 'html.parser')
-        
-        paragraphs = soup.find_all('p')
-        text = " ".join([p.get_text() for p in paragraphs[:10]])
-        
-        img_url = None
-        img_tag = soup.find('meta', property='og:image') or soup.find('meta', attrs={'name': 'twitter:image'})
-        if img_tag:
-            img_url = img_tag.get('content')
-        else:
-            first_img = soup.find('img')
-            if first_img and first_img.get('src') and first_img.get('src').startswith('http'):
-                img_url = first_img.get('src')
-                
-        return {"text": text if len(text) > 200 else None, "image": img_url}
-    except Exception as e:
-        print(f"❌ Scraping fail: {url} -> {e}")
-        return {"text": None, "image": None}
+# Helper for document projection
+def clean_doc(doc: dict) -> dict:
+    if not doc:
+        return {}
+    if "_id" in doc:
+        doc["_id"] = str(doc["_id"])
+    if "canonical_url" not in doc or not doc["canonical_url"]:
+        doc["canonical_url"] = f"{config.FRONTEND_URL}/news/{doc.get('slug', '')}"
+    return doc
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-def call_groq_api(prompt):
-    chat_completion = groq_client.chat.completions.create(
-        messages=[{"role": "user", "content": prompt}],
-        model="llama-3.3-70b-versatile",
-        temperature=0.7,
-    )
-    return chat_completion.choices[0].message.content
+# ==========================================
+# HEALTH & SERVICE STATUS
+# ==========================================
+@app.get("/", tags=["Health"])
+def root_info():
+    return {
+        "status": "ok",
+        "service": "TezKhabar Backend Engine",
+        "version": "6.0.0",
+        "frontend": config.FRONTEND_URL,
+        "database": get_db_health()
+    }
 
-def rewrite_to_hinglish_groq(raw_text):
-    prompt = f"""
-    You are a viral Indian News Editor. Rewrite the following news into highly engaging, viral Hinglish (Roman script mix of Hindi and English).
-    
-    CRITICAL RULES:
-    1. TONE: Energetic, youth-centric, spicy, and extremely catchy.
-    2. OUTPUT STRUCTURE: Strictly output in this exact schema format:
-       [TITLE] Put the viral title here
-       [TAG] Single category tag (Politics, Bollywood, Tech, Sports, Crypto)
-       [BADGE] [Breaking 🚨] or [Spicy 🔥] or [Alert ⚠️] or [Trending 🚀]
-       [BODY] Put the full news body here
-    
-    Source Text: {raw_text}
-    """
-    try:
-        return call_groq_api(prompt)
-    except Exception as e:
-        print(f"❌ Groq System Error: {e}")
-        return None
+@app.get("/health", tags=["Health"])
+def health_check():
+    db_status = get_db_health()
+    return {
+        "status": "ok" if db_status == "connected" else "degraded",
+        "service": "tezkhabar-backend",
+        "database": db_status,
+        "version": "6.0.0"
+    }
 
-def save_to_mongodb(ai_output, image_url, source_url, fallback_title="Breaking News"):
-    try:
-        title = fallback_title
-        body_content = "News content updates shortly."
-        tag = "General"
-        badge = "[Breaking 🚨]"
+# ==========================================
+# PUBLIC NEWS APIS
+# ==========================================
+@app.get("/api/news", response_model=NewsListResponse, tags=["News"])
+def get_news_list(
+    category: Optional[str] = Query(None, description="Filter by category"),
+    page: int = Query(1, ge=1, description="Page number"),
+    limit: int = Query(20, ge=1, le=50, description="Items per page"),
+    sort: str = Query("latest", description="Sort order: latest")
+):
+    if news_collection is None:
+        return NewsListResponse(items=[], pagination=PaginationMetadata(page=page, limit=limit, total=0, has_next=False))
 
-        if ai_output and "[BODY]" in ai_output:
-            parts_body = ai_output.split("[BODY]")
-            body_content = parts_body[1].strip()
-            
-            parts_title_segment = parts_body[0].split("[BADGE]")
-            if len(parts_title_segment) > 1:
-                badge = parts_title_segment[1].strip()
-            
-            parts_title_tag = parts_title_segment[0].split("[TAG]")
-            title = parts_title_tag[0].replace("[TITLE]", "").strip()
-            if len(parts_title_tag) > 1:
-                tag = parts_title_tag[1].strip()
-
-        if posts_collection.find_one({"source_url": source_url}):
-            print(f"箱 Already exists in DB: {title}")
-            return
-
-        slug = title.lower().replace(" ", "-").replace("?", "").replace("!", "").replace("'", "")
-        slug = "".join([c for c in slug if c.isalnum() or c == '-'])[:60]
-
-        payload = {
-            "title": title,
-            "slug": slug,
-            "content": body_content,
-            "category": tag,
-            "badge": badge,
-            "image_url": image_url,
-            "source_url": source_url,
-            "created_at": time.time()
-        }
-        
-        insert_res = posts_collection.insert_one(payload)
-        generated_url = f"{RENDER_EXTERNAL_URL}/news/{slug}"
-        print(f"🚀 INSERT SUCCESSFUL! ID: {insert_res.inserted_id} | Title: {title}")
-        
-        # Trigger Instant Indexing Worker Immediately after successful MongoDB Write
-        push_to_google_instant_index(generated_url)
-        
-    except Exception as e:
-        print(f"❌ MongoDB Custom Insertion Crash: {e}")
-
-def run_core_scraping_engine():
-    feeds = [
-        "https://news.google.com/rss/search?q=politics+India&hl=en-IN&gl=IN&ceid=IN:en",
-        "https://news.google.com/rss/search?q=Bollywood&hl=en-IN&gl=IN&ceid=IN:en",
-        "https://news.google.com/rss/search?q=Tech+India&hl=en-IN&gl=IN&ceid=IN:en"
-    ]
-    scraped_count = 0
-    for feed_url in feeds:
-        feed = feedparser.parse(feed_url)
-        for entry in feed.entries[:3]:
-            if not posts_collection.find_one({"source_url": entry.link}):
-                print(f"📰 Targeting Fresh Post: {entry.title}")
-                article_data = scrape_article_data(entry.link)
-                
-                text_content = article_data["text"] if article_data["text"] else entry.title + " full updates coming soon."
-                ai_content = rewrite_to_hinglish_groq(text_content)
-                save_to_mongodb(ai_content, article_data["image"], entry.link, fallback_title=entry.title)
-                scraped_count += 1
-                time.sleep(3)
-    return scraped_count
-
-def news_scrapper_loop():
-    print("🔄 TezKhabar Core Engine Background Scraper Loop Online...")
-    while True:
-        try:
-            run_core_scraping_engine()
-        except Exception as e:
-            print(f"⚠️ Master Loop Exception: {e}")
-        
-        print("💤 Scraper cooling down. Going to sleep for 10 minutes...")
-        time.sleep(600)  # 60 seconds * 10 minutes
-
-# --- PRODUCTION API ENDPOINTS FOR FRONTEND ---
-
-@app.get("/")
-def home():
-    return {"status": "TezKhabar Master Core Engine v5.0 Live & Operational"}
-
-@app.get("/api/news")
-def get_all_news(category: str = None, limit: int = 20):
-    query = {}
+    query = {"content_status": "published"}
     if category:
-        query["category"] = category
-    cursor = posts_collection.find(query, {"_id": 0}).sort("created_at", -1).limit(limit)
-    return list(cursor)
+        query["category"] = category.lower()
 
-@app.get("/api/scrape-now")
-def force_scrape():
-    """Bypasses cooling timer. Instantly forces an extraction and indexing push query"""
-    try:
-        count = run_core_scraping_engine()
-        return {"status": "Success", "items_processed": count}
-    except Exception as e:
-        return {"status": "Error", "message": str(e)}
+    total = news_collection.count_documents(query)
+    skip = (page - 1) * limit
+    cursor = news_collection.find(query).sort("published_at", -1).skip(skip).limit(limit)
 
-@app.get("/api/sitemap.xml")
-def get_dynamic_sitemap():
-    urlset = ET.Element("urlset", xmlns="http://www.sitemaps.org/schemas/sitemap/0.9")
-    home_url = ET.SubElement(urlset, "url")
-    ET.SubElement(home_url, "loc").text = RENDER_EXTERNAL_URL
-    ET.SubElement(home_url, "priority").text = "1.0"
-    
-    cursor = posts_collection.find({}, {"slug": 1, "created_at": 1}).sort("created_at", -1).limit(500)
-    for post in cursor:
-        if "slug" in post:
-            url_node = ET.SubElement(urlset, "url")
-            ET.SubElement(url_node, "loc").text = f"{RENDER_EXTERNAL_URL}/news/{post['slug']}"
-            ET.SubElement(url_node, "priority").text = "0.8"
-            
-    xml_str = ET.tostring(urlset, encoding='utf-8')
-    parsed_xml = minidom.parseString(xml_str)
-    return Response(content=parsed_xml.toprettyxml(indent="  "), media_type="application/xml")
+    items = [ArticleDocument(**clean_doc(d)) for d in cursor]
+    has_next = (skip + limit) < total
 
-if __name__ == "__main__":
-    scraper_thread = threading.Thread(target=news_scrapper_loop, daemon=True)
-    scraper_thread.start()
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    return NewsListResponse(
+        items=items,
+        pagination=PaginationMetadata(page=page, limit=limit, total=total, has_next=has_next)
+    )
+
+@app.get("/api/news/{slug}", response_model=SingleArticleResponse, tags=["News"])
+def get_article_by_slug(slug: str):
+    if news_collection is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    doc = news_collection.find_one({"slug": slug, "content_status": "published"})
+    if not doc:
+        # Fallback check by ID
+        doc = news_collection.find_one({"_id": slug})
+
+    if not doc:
+        raise HTTPException(status_code=404, detail="Article not found")
+
+    return SingleArticleResponse(article=ArticleDocument(**clean_doc(doc)))
+
+@app.get("/api/latest", response_model=NewsListResponse, tags=["News"])
+def get_latest_news_wire(limit: int = Query(15, ge=1, le=50)):
+    return get_news_list(category=None, page=1, limit=limit, sort="latest")
+
+@app.get("/api/trending", response_model=NewsListResponse, tags=["Trending"])
+def get_trending_news(limit: int = Query(10, ge=1, le=30)):
+    if news_collection is None:
+        return NewsListResponse(items=[], pagination=PaginationMetadata(page=1, limit=limit, total=0, has_next=False))
+
+    query = {"content_status": "published"}
+    cursor = news_collection.find(query).sort([("source_count", -1), ("published_at", -1)]).limit(limit)
+    items = [ArticleDocument(**clean_doc(d)) for d in cursor]
+
+    return NewsListResponse(
+        items=items,
+        pagination=PaginationMetadata(page=1, limit=limit, total=len(items), has_next=False)
+    )
+
+@app.get("/api/categories", response_model=list[CategoryCountItem], tags=["Categories"])
+def get_categories():
+    if news_collection is None:
+        return []
+
+    pipeline = [
+        {"$match": {"content_status": "published"}},
+        {"$group": {"_id": "$category", "count": {"$sum": 1}}},
+        {"$sort": {"count": -1}}
+    ]
+    results = list(news_collection.aggregate(pipeline))
+    categories = []
+    for r in results:
+        cat_name = str(r["_id"]).title()
+        categories.append(CategoryCountItem(name=cat_name, slug=str(r["_id"]), count=r["count"]))
+    return categories
+
+@app.get("/api/search", response_model=NewsListResponse, tags=["Search"])
+def search_articles(
+    q: str = Query(..., min_length=1, max_length=100, description="Search query"),
+    category: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=50)
+):
+    if news_collection is None or not q.strip():
+        return NewsListResponse(items=[], pagination=PaginationMetadata(page=page, limit=limit, total=0, has_next=False))
+
+    regex_query = {"$regex": q.strip(), "$options": "i"}
+    match_condition = {
+        "content_status": "published",
+        "$or": [
+            {"title": regex_query},
+            {"summary": regex_query},
+            {"dek": regex_query}
+        ]
+    }
+    if category:
+        match_condition["category"] = category.lower()
+
+    total = news_collection.count_documents(match_condition)
+    skip = (page - 1) * limit
+    cursor = news_collection.find(match_condition).sort("published_at", -1).skip(skip).limit(limit)
+
+    items = [ArticleDocument(**clean_doc(d)) for d in cursor]
+    has_next = (skip + limit) < total
+
+    return NewsListResponse(
+        items=items,
+        pagination=PaginationMetadata(page=page, limit=limit, total=total, has_next=has_next)
+    )
+
+# ==========================================
+# PROTECTED ADMIN ENDPOINTS
+# ==========================================
+def verify_admin(x_admin_key: Optional[str] = Header(None)):
+    if not x_admin_key or x_admin_key != config.ADMIN_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized: Invalid Admin Credentials")
+
+@app.post("/api/admin/scrape-now", tags=["Admin"])
+def trigger_manual_scrape(x_admin_key: Optional[str] = Header(None)):
+    verify_admin(x_admin_key)
+    res = run_news_scraper()
+    return {"message": "Scrape operation completed", "result": res}
+
+@app.get("/api/admin/stats", response_model=AdminStatsResponse, tags=["Admin"])
+def get_admin_metrics(x_admin_key: Optional[str] = Header(None)):
+    verify_admin(x_admin_key)
+    if news_collection is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    total_articles = news_collection.count_documents({})
+    pipeline = [{"$group": {"_id": "$category", "count": {"$sum": 1}}}]
+    category_counts = [{"category": r["_id"], "count": r["count"]} for r in news_collection.aggregate(pipeline)]
+
+    return AdminStatsResponse(
+        total_articles=total_articles,
+        articles_today=scraper_stats.get("articles_saved", 0),
+        articles_last_24h=scraper_stats.get("articles_saved", 0),
+        last_scrape_started=scraper_stats.get("last_scrape_started"),
+        last_scrape_finished=scraper_stats.get("last_scrape_finished"),
+        last_scrape_success=scraper_stats.get("last_scrape_success", True),
+        articles_discovered=scraper_stats.get("articles_discovered", 0),
+        articles_saved=scraper_stats.get("articles_saved", 0),
+        articles_skipped=scraper_stats.get("articles_skipped", 0),
+        category_counts=category_counts
+    )
+
+# ==========================================
+# XML SITEMAPS (Points to FRONTEND_URL)
+# ==========================================
+@app.get("/sitemap.xml", response_class=PlainResponse, tags=["SEO"])
+def get_main_sitemap():
+    if news_collection is None:
+        return PlainResponse("<urlset xmlns='http://www.sitemaps.org/schemas/sitemap/0.9'></urlset>", media_type="application/xml")
+
+    articles = list(news_collection.find({"content_status": "published"}).sort("published_at", -1).limit(100))
+    xml_lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
+        f'  <url><loc>{config.FRONTEND_URL}</loc><changefreq>always</changefreq><priority>1.0</priority></url>'
+    ]
+
+    for cat in config.CONTROLLED_CATEGORIES:
+        xml_lines.append(f'  <url><loc>{config.FRONTEND_URL}/category/{cat}</loc><changefreq>hourly</changefreq><priority>0.8</priority></url>')
+
+    for a in articles:
+        slug = xml.sax.saxutils.escape(a.get("slug", ""))
+        xml_lines.append(f'  <url><loc>{config.FRONTEND_URL}/news/{slug}</loc><changefreq>never</changefreq><priority>0.9</priority></url>')
+
+    xml_lines.append('</urlset>')
+    return PlainResponse("\n".join(xml_lines), media_type="application/xml")
+
+@app.get("/news-sitemap.xml", response_class=PlainResponse, tags=["SEO"])
+def get_news_sitemap():
+    if news_collection is None:
+        return PlainResponse("<urlset xmlns='http://www.sitemaps.org/schemas/sitemap/0.9'></urlset>", media_type="application/xml")
+
+    articles = list(news_collection.find({"content_status": "published"}).sort("published_at", -1).limit(50))
+    xml_lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:news="http://www.google.com/schemas/sitemap-news/0.9">'
+    ]
+
+    for a in articles:
+        slug = xml.sax.saxutils.escape(a.get("slug", ""))
+        title = xml.sax.saxutils.escape(a.get("title", ""))
+        pub_date = a.get("published_at", datetime.now(timezone.utc).isoformat())
+        xml_lines.append('  <url>')
+        xml_lines.append(f'    <loc>{config.FRONTEND_URL}/news/{slug}</loc>')
+        xml_lines.append('    <news:news>')
+        xml_lines.append('      <news:publication><news:name>TezKhabar</news:name><news:language>en</news:language></news:publication>')
+        xml_lines.append(f'      <news:publication_date>{pub_date}</news:publication_date>')
+        xml_lines.append(f'      <news:title>{title}</news:title>')
+        xml_lines.append('    </news:news>')
+        xml_lines.append('  </url>')
+
+    xml_lines.append('</urlset>')
+    return PlainResponse("\n".join(xml_lines), media_type="application/xml")
