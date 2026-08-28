@@ -9,32 +9,36 @@ class NewsSourceItem(BaseModel):
     stance: Optional[str] = None
 
 class ArticleDocument(BaseModel):
+    id: Optional[str] = None
     slug: str
     title: str
     dek: str = ""
     summary: str = ""
+    description: str = ""
     content: str = ""
     category: str = "india"
-    subcategory: Optional[str] = None
+    subcategory: Optional[str] = "India"
     badge: Optional[str] = None
+    image: Optional[str] = None
     image_url: Optional[str] = None
-    source_url: str
-    source_name: str
-    source_domain: str
+    source: str = "TezKhabar Wire"
+    source_name: str = "TezKhabar Wire"
+    source_url: str = "#"
+    source_domain: Optional[str] = None
     author: Optional[str] = None
     published_at: str
     updated_at: Optional[str] = None
     created_at: str
     language: str = "en"
     region: str = "IN"
-    story_cluster_id: str
+    story_cluster_id: Optional[str] = None
     source_count: int = 1
     sources: List[NewsSourceItem] = []
     key_facts: List[str] = []
     why_it_matters: Optional[str] = None
     timeline: List[dict] = []
     ai_summary: Optional[str] = None
-    ai_generated: bool = True
+    ai_generated: bool = False
     content_status: str = "published"
     confidence: str = "developing"
     canonical_source_url: Optional[str] = None

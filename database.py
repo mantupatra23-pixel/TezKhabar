@@ -1,8 +1,10 @@
+import re
 import logging
 from pymongo import MongoClient, ASCENDING, DESCENDING
 from pymongo.collection import Collection
 from pymongo.database import Database
 import config
+from extractor import strip_html_tags, is_valid_article_image
 
 logger = logging.getLogger("tezkhabar.db")
 
@@ -34,26 +36,73 @@ def get_news_collection() -> Collection:
         _news_collection = db_instance[config.MONGO_COLLECTION_NAME]
     return _news_collection
 
-def normalize_existing_documents():
+def normalize_slug_string(text: str) -> str:
+    cleaned = re.sub(r"[^\w\s-]", "", text).lower().strip()
+    return re.sub(r"[-\s]+", "-", cleaned)[:90].rstrip("-")
+
+def migrate_and_clean_existing_documents():
+    """
+    Normalizes existing records without deleting any document.
+    """
     try:
         col = get_news_collection()
-        # Ensure all existing articles have content_status="published" and canonical_url
-        result = col.update_many(
-            {
-                "$or": [
-                    {"content_status": {"$exists": False}},
-                    {"content_status": None},
-                    {"status": "published"}
-                ]
-            },
-            {
-                "$set": {
-                    "content_status": "published"
+        cursor = col.find({})
+        updated_count = 0
+        seen_slugs = set()
+
+        for doc in cursor:
+            doc_id = doc["_id"]
+            title = doc.get("title", "News Story")
+            raw_slug = doc.get("slug")
+            
+            # Generate valid slug if missing
+            if not raw_slug or not str(raw_slug).strip():
+                base_slug = normalize_slug_string(title) or f"story-{str(doc_id)[:8]}"
+            else:
+                base_slug = normalize_slug_string(str(raw_slug))
+
+            # Ensure uniqueness
+            slug = base_slug
+            idx = 2
+            while slug in seen_slugs:
+                slug = f"{base_slug}-{idx}"
+                idx += 1
+            seen_slugs.add(slug)
+
+            # Clean raw HTML from dek / summary
+            clean_summary = strip_html_tags(doc.get("summary") or doc.get("dek") or title)
+            clean_dek = strip_html_tags(doc.get("dek") or clean_summary[:140])
+
+            # Validate image
+            raw_img = doc.get("image_url") or doc.get("image")
+            image_url = raw_img if is_valid_article_image(raw_img) else None
+
+            # Fix source name if it says Google News
+            source_name = doc.get("source_name") or doc.get("source") or "TezKhabar Wire"
+            if source_name.lower() == "google news" and doc.get("source_domain"):
+                source_name = doc.get("source_domain").replace("www.", "")
+
+            col.update_one(
+                {"_id": doc_id},
+                {
+                    "$set": {
+                        "slug": slug,
+                        "title": strip_html_tags(title),
+                        "summary": clean_summary,
+                        "description": clean_summary,
+                        "dek": clean_dek,
+                        "image": image_url,
+                        "image_url": image_url,
+                        "source": source_name,
+                        "source_name": source_name,
+                        "content_status": "published",
+                        "canonical_url": f"{config.FRONTEND_URL}/news/{slug}"
+                    }
                 }
-            }
-        )
-        if result.modified_count > 0:
-            logger.info(f"[DB Migration] Normalized {result.modified_count} existing articles to 'published' status.")
+            )
+            updated_count += 1
+
+        logger.info(f"[DB Migration] Successfully verified and normalized {updated_count} articles.")
     except Exception as e:
         logger.error(f"[DB Migration Error]: {e}")
 
@@ -63,20 +112,19 @@ def init_db() -> bool:
         client.admin.command("ping")
         col = get_news_collection()
         
-        col.create_index([("source_url", ASCENDING)], unique=True, background=True)
+        # Run safe normalization first
+        migrate_and_clean_existing_documents()
+
+        # Create indexes
         col.create_index([("slug", ASCENDING)], unique=True, background=True)
+        col.create_index([("source_url", ASCENDING)], unique=True, background=True)
         col.create_index([("published_at", DESCENDING)], background=True)
         col.create_index([("created_at", DESCENDING)], background=True)
         col.create_index([("category", ASCENDING), ("published_at", DESCENDING)], background=True)
         col.create_index([("content_status", ASCENDING)], background=True)
-        col.create_index([("story_cluster_id", ASCENDING)], background=True)
-        col.create_index([("source_name", ASCENDING)], background=True)
-        
-        normalize_existing_documents()
         
         count = col.count_documents({})
-        published_count = col.count_documents({"content_status": "published"})
-        logger.info(f"[DB] Connected to MongoDB. Database: '{config.MONGO_DB_NAME}', Total Articles: {count}, Published: {published_count}")
+        logger.info(f"[DB] Connected to MongoDB. Database: '{config.MONGO_DB_NAME}', Verified Articles: {count}")
         return True
     except Exception as e:
         logger.error(f"[DB] MongoDB initialization warning: {e}")
