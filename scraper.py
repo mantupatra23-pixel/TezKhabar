@@ -21,10 +21,8 @@ scraper_stats = {
     "rss_entries_seen": 0,
     "new_candidates": 0,
     "duplicates": 0,
-    "extraction_success": 0,
-    "extraction_failed": 0,
     "ai_success": 0,
-    "ai_failed": 0,
+    "ai_fallback": 0,
     "articles_saved": 0,
     "articles_skipped": 0,
 }
@@ -51,10 +49,8 @@ def run_news_scraper() -> dict:
     rss_entries_seen = 0
     new_candidates = 0
     duplicates = 0
-    extraction_success = 0
-    extraction_failed = 0
     ai_success = 0
-    ai_failed = 0
+    ai_fallback = 0
     articles_saved = 0
     articles_skipped = 0
 
@@ -105,11 +101,9 @@ def run_news_scraper() -> dict:
                 # Extraction
                 extracted = extract_article(source_url, fallback_title=raw_title, fallback_summary=raw_summary)
                 if not extracted["success"]:
-                    extraction_failed += 1
                     articles_skipped += 1
                     continue
 
-                extraction_success += 1
                 article_title = extracted["title"] or raw_title
                 article_body = extracted["body"]
                 cluster_id = generate_cluster_id(article_title, feed_cat)
@@ -138,24 +132,12 @@ def run_news_scraper() -> dict:
                     articles_saved += 1
                     continue
 
-                # Process through AI
-                try:
-                    ai_data = process_article_with_ai(article_title, article_body, feed_name, feed_cat)
+                # AI Processing with fallback
+                ai_data = process_article_with_ai(article_title, article_body, feed_name, feed_cat)
+                if ai_data.get("ai_generated", False):
                     ai_success += 1
-                except Exception as e:
-                    logger.warning(f"[AI] Failed for '{article_title[:40]}': {e}")
-                    ai_failed += 1
-                    ai_data = {
-                        "title": article_title,
-                        "dek": article_body[:140],
-                        "summary": article_body[:280],
-                        "category": feed_cat,
-                        "subcategory": "India",
-                        "content": f"<p>{article_body[:500]}</p>",
-                        "key_facts": [article_title],
-                        "why_it_matters": f"Reported by {feed_name}.",
-                        "confidence": "developing"
-                    }
+                else:
+                    ai_fallback += 1
 
                 # Generate Unique Slug
                 base_slug = create_slug(ai_data.get("title", article_title))
@@ -199,9 +181,9 @@ def run_news_scraper() -> dict:
                     "why_it_matters": ai_data.get("why_it_matters", ""),
                     "timeline": [],
                     "ai_summary": ai_data.get("summary", ""),
-                    "ai_generated": True,
+                    "ai_generated": ai_data.get("ai_generated", False),
                     "content_status": "published",
-                    "confidence": "developing",
+                    "confidence": ai_data.get("confidence", "developing"),
                     "canonical_source_url": source_url,
                     "canonical_url": canonical_url,
                     "word_count": extracted.get("word_count", 0),
@@ -222,15 +204,13 @@ def run_news_scraper() -> dict:
         scraper_stats["rss_entries_seen"] = rss_entries_seen
         scraper_stats["new_candidates"] = new_candidates
         scraper_stats["duplicates"] = duplicates
-        scraper_stats["extraction_success"] = extraction_success
-        scraper_stats["extraction_failed"] = extraction_failed
         scraper_stats["ai_success"] = ai_success
-        scraper_stats["ai_failed"] = ai_failed
+        scraper_stats["ai_fallback"] = ai_fallback
         scraper_stats["articles_saved"] = articles_saved
         scraper_stats["articles_skipped"] = articles_skipped
         scrape_lock.release()
 
-        logger.info(f"[Scraper] Finished | Feeds={feeds_seen} | RSS Entries={rss_entries_seen} | Candidates={new_candidates} | Duplicates={duplicates} | Saved={articles_saved} | Skipped={articles_skipped}")
+        logger.info(f"[Scraper] Finished | Feeds={feeds_seen} | RSS Entries={rss_entries_seen} | Candidates={new_candidates} | Duplicates={duplicates} | AI Success={ai_success} | Fallback={ai_fallback} | Saved={articles_saved}")
 
     return {
         "status": "completed" if scraper_stats["last_scrape_success"] else "error",
@@ -238,12 +218,13 @@ def run_news_scraper() -> dict:
         "entries": rss_entries_seen,
         "new": new_candidates,
         "duplicates": duplicates,
+        "ai_success": ai_success,
+        "ai_fallback": ai_fallback,
         "saved": articles_saved,
         "skipped": articles_skipped,
     }
 
 def background_scraper_loop():
-    # Initial immediate ingestion run on startup
     time.sleep(3)
     try:
         run_news_scraper()

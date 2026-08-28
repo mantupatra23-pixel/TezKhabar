@@ -72,8 +72,28 @@ def clean_doc(doc: dict) -> dict:
         return {}
     if "_id" in doc:
         doc["_id"] = str(doc["_id"])
-    if "canonical_url" not in doc or not doc["canonical_url"]:
-        doc["canonical_url"] = f"{config.FRONTEND_URL}/news/{doc.get('slug', '')}"
+    
+    slug = str(doc.get("slug") or doc.get("_id") or "news-story")
+    doc["slug"] = slug
+    doc["title"] = str(doc.get("title") or doc.get("headline") or "News Story")
+    doc["dek"] = str(doc.get("dek") or "")
+    doc["summary"] = str(doc.get("summary") or doc.get("description") or doc["title"])
+    doc["content"] = str(doc.get("content") or doc.get("body") or f"<p>{doc['summary']}</p>")
+    doc["category"] = str(doc.get("category") or "india").lower()
+    doc["source_name"] = str(doc.get("source_name") or doc.get("source") or "TezKhabar Wire")
+    doc["source_domain"] = str(doc.get("source_domain") or "news.google.com")
+    doc["source_url"] = str(doc.get("source_url") or doc.get("link") or "#")
+    doc["published_at"] = str(doc.get("published_at") or doc.get("created_at") or datetime.now(timezone.utc).isoformat())
+    doc["created_at"] = str(doc.get("created_at") or doc["published_at"])
+    doc["canonical_url"] = str(doc.get("canonical_url") or f"{config.FRONTEND_URL}/news/{slug}")
+    doc["content_status"] = "published"
+    doc["story_cluster_id"] = str(doc.get("story_cluster_id") or f"{doc['category']}-{slug[:20]}")
+    doc["sources"] = doc.get("sources") if isinstance(doc.get("sources"), list) else []
+    doc["key_facts"] = doc.get("key_facts") if isinstance(doc.get("key_facts"), list) else []
+    doc["timeline"] = doc.get("timeline") if isinstance(doc.get("timeline"), list) else []
+    doc["source_count"] = int(doc.get("source_count") or max(len(doc["sources"]), 1))
+    doc["ai_generated"] = bool(doc.get("ai_generated", False))
+    doc["confidence"] = str(doc.get("confidence") or "developing")
     return doc
 
 @app.get("/", tags=["Health"])
@@ -109,7 +129,13 @@ def get_news_list(
     if col is None:
         return NewsListResponse(items=[], pagination=PaginationMetadata(page=page, limit=limit, total=0, has_next=False))
 
-    query = {"content_status": "published"}
+    query = {
+        "$or": [
+            {"content_status": "published"},
+            {"content_status": {"$exists": False}},
+            {"status": "published"}
+        ]
+    }
     if category:
         query["category"] = category.lower()
 
@@ -119,6 +145,7 @@ def get_news_list(
         cursor = col.find(query).sort("published_at", -1).skip(skip).limit(limit)
         items = [ArticleDocument(**clean_doc(d)) for d in cursor]
         has_next = (skip + limit) < total
+        logger.info(f"[API] /api/news requested_limit={limit} db_total={total} returned={len(items)}")
     except Exception as e:
         logger.error(f"[News List Error]: {e}")
         return NewsListResponse(items=[], pagination=PaginationMetadata(page=page, limit=limit, total=0, has_next=False))
@@ -134,7 +161,7 @@ def fetch_single_article(slug: str):
         raise HTTPException(status_code=503, detail="Database unavailable")
 
     try:
-        doc = col.find_one({"slug": slug, "content_status": "published"})
+        doc = col.find_one({"slug": slug})
         if not doc:
             doc = col.find_one({"_id": slug})
     except Exception as e:
@@ -165,7 +192,7 @@ def get_trending_news(limit: int = Query(10, ge=1, le=30)):
         return NewsListResponse(items=[], pagination=PaginationMetadata(page=1, limit=limit, total=0, has_next=False))
 
     try:
-        cursor = col.find({"content_status": "published"}).sort([("source_count", -1), ("published_at", -1)]).limit(limit)
+        cursor = col.find({}).sort([("source_count", -1), ("published_at", -1)]).limit(limit)
         items = [ArticleDocument(**clean_doc(d)) for d in cursor]
     except Exception:
         items = []
@@ -183,12 +210,11 @@ def get_categories():
 
     try:
         pipeline = [
-            {"$match": {"content_status": "published"}},
             {"$group": {"_id": "$category", "count": {"$sum": 1}}},
             {"$sort": {"count": -1}}
         ]
         results = list(col.aggregate(pipeline))
-        return [CategoryCountItem(name=str(r["_id"]).title(), slug=str(r["_id"]), count=r["count"]) for r in results]
+        return [CategoryCountItem(name=str(r["_id"]).title(), slug=str(r["_id"]), count=r["count"]) for r in results if r.get("_id")]
     except Exception:
         return []
 
@@ -206,7 +232,6 @@ def search_articles(
     try:
         regex_query = {"$regex": q.strip(), "$options": "i"}
         match_condition = {
-            "content_status": "published",
             "$or": [{"title": regex_query}, {"summary": regex_query}, {"dek": regex_query}]
         }
         if category:
@@ -269,7 +294,7 @@ def get_main_sitemap():
     if col is None:
         return PlainResponse("<urlset xmlns='http://www.sitemaps.org/schemas/sitemap/0.9'></urlset>", media_type="application/xml")
 
-    articles = list(col.find({"content_status": "published"}).sort("published_at", -1).limit(100))
+    articles = list(col.find({}).sort("published_at", -1).limit(100))
     xml_lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
@@ -292,7 +317,7 @@ def get_news_sitemap():
     if col is None:
         return PlainResponse("<urlset xmlns='http://www.sitemaps.org/schemas/sitemap/0.9'></urlset>", media_type="application/xml")
 
-    articles = list(col.find({"content_status": "published"}).sort("published_at", -1).limit(50))
+    articles = list(col.find({}).sort("published_at", -1).limit(50))
     xml_lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:news="http://www.google.com/schemas/sitemap-news/0.9">'
