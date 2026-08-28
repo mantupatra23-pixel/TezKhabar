@@ -5,7 +5,7 @@ import urllib.parse
 from datetime import datetime, timezone
 import feedparser
 import config
-from database import news_collection
+from database import get_news_collection
 from extractor import clean_source_url, extract_article
 from ai_pipeline import create_slug, generate_cluster_id, process_article_with_ai
 
@@ -17,12 +17,18 @@ scraper_stats = {
     "last_scrape_started": None,
     "last_scrape_finished": None,
     "last_scrape_success": True,
-    "articles_discovered": 0,
+    "feeds_seen": 0,
+    "rss_entries_seen": 0,
+    "new_candidates": 0,
+    "duplicates": 0,
+    "extraction_success": 0,
+    "extraction_failed": 0,
+    "ai_success": 0,
+    "ai_failed": 0,
     "articles_saved": 0,
     "articles_skipped": 0,
 }
 
-# Controlled Indian & Global Editorial Feeds
 RSS_FEEDS = [
     {"name": "Google News India", "category": "india", "url": "https://news.google.com/rss?hl=en-IN&gl=IN&ceid=IN:en"},
     {"name": "Google News Politics", "category": "politics", "url": "https://news.google.com/rss/headlines/section/topic/POLITICS?hl=en-IN&gl=IN&ceid=IN:en"},
@@ -35,95 +41,127 @@ RSS_FEEDS = [
 
 def run_news_scraper() -> dict:
     if not scrape_lock.acquire(blocking=False):
-        logger.warning("[Scraper] Scraper is already active. Skipping concurrent run.")
+        logger.warning("[Scraper] Scraper is already running. Skipping concurrent run.")
         return {"status": "already_running"}
 
     start_iso = datetime.now(timezone.utc).isoformat()
     scraper_stats["last_scrape_started"] = start_iso
-    discovered = 0
-    saved = 0
-    skipped = 0
+
+    feeds_seen = 0
+    rss_entries_seen = 0
+    new_candidates = 0
+    duplicates = 0
+    extraction_success = 0
+    extraction_failed = 0
+    ai_success = 0
+    ai_failed = 0
+    articles_saved = 0
+    articles_skipped = 0
 
     logger.info(f"[Scraper] News ingestion pipeline started at {start_iso}")
 
     try:
-        if news_collection is None:
-            logger.error("[Scraper] Database not connected. Aborting run.")
+        col = get_news_collection()
+        if col is None:
+            logger.error("[Scraper] Database collection is None. Aborting run.")
             return {"status": "db_not_connected"}
 
         for feed in RSS_FEEDS:
+            feeds_seen += 1
             feed_name = feed["name"]
             feed_cat = feed["category"]
             feed_url = feed["url"]
 
+            logger.info(f"[RSS] Fetching: {feed_name}")
             try:
                 parsed = feedparser.parse(feed_url)
                 entries = parsed.entries[:config.MAX_ARTICLES_PER_FEED]
+                logger.info(f"[RSS] {feed_name}: HTTP status 200, Entries: {len(entries)}")
             except Exception as e:
-                logger.error(f"[Scraper] Failed to fetch feed {feed_name}: {e}")
+                logger.error(f"[RSS] Failed to fetch feed {feed_name}: {e}")
                 continue
 
             for entry in entries:
-                discovered += 1
+                rss_entries_seen += 1
                 raw_url = getattr(entry, "link", None)
                 raw_title = getattr(entry, "title", "").strip()
+                raw_summary = getattr(entry, "summary", "").strip()
 
                 if not raw_url or not raw_title:
-                    skipped += 1
+                    articles_skipped += 1
                     continue
 
                 source_url = clean_source_url(raw_url)
                 domain = urllib.parse.urlparse(source_url).netloc
 
-                # Duplicate Check by Source URL
-                if news_collection.find_one({"source_url": source_url}):
-                    skipped += 1
+                # Duplicate check
+                if col.find_one({"source_url": source_url}):
+                    duplicates += 1
+                    articles_skipped += 1
                     continue
 
-                # Extract Article Content
-                extracted = extract_article(source_url)
+                new_candidates += 1
+
+                # Extraction
+                extracted = extract_article(source_url, fallback_title=raw_title, fallback_summary=raw_summary)
                 if not extracted["success"]:
-                    skipped += 1
+                    extraction_failed += 1
+                    articles_skipped += 1
                     continue
 
+                extraction_success += 1
                 article_title = extracted["title"] or raw_title
                 article_body = extracted["body"]
                 cluster_id = generate_cluster_id(article_title, feed_cat)
 
-                # Check if cluster already exists (Multi-source aggregation)
-                existing_cluster = news_collection.find_one({"story_cluster_id": cluster_id})
                 now_iso = datetime.now(timezone.utc).isoformat()
+                existing_cluster = col.find_one({"story_cluster_id": cluster_id})
 
                 if existing_cluster:
-                    # Append source to existing cluster story
                     new_source = {
                         "name": feed_name,
                         "url": source_url,
                         "published_at": extracted["published_at"] or now_iso,
                         "domain": domain
                     }
-                    news_collection.update_one(
+                    col.update_one(
                         {"_id": existing_cluster["_id"]},
                         {
                             "$inc": {"source_count": 1},
                             "$addToSet": {"sources": new_source},
                             "$set": {
                                 "updated_at": now_iso,
-                                "confidence": "multi_source" if existing_cluster.get("source_count", 1) >= 1 else "high_confidence"
+                                "confidence": "multi_source"
                             }
                         }
                     )
-                    saved += 1
+                    articles_saved += 1
                     continue
 
-                # Process new story through AI
-                ai_data = process_article_with_ai(article_title, article_body, feed_name, feed_cat)
+                # Process through AI
+                try:
+                    ai_data = process_article_with_ai(article_title, article_body, feed_name, feed_cat)
+                    ai_success += 1
+                except Exception as e:
+                    logger.warning(f"[AI] Failed for '{article_title[:40]}': {e}")
+                    ai_failed += 1
+                    ai_data = {
+                        "title": article_title,
+                        "dek": article_body[:140],
+                        "summary": article_body[:280],
+                        "category": feed_cat,
+                        "subcategory": "India",
+                        "content": f"<p>{article_body[:500]}</p>",
+                        "key_facts": [article_title],
+                        "why_it_matters": f"Reported by {feed_name}.",
+                        "confidence": "developing"
+                    }
 
                 # Generate Unique Slug
                 base_slug = create_slug(ai_data.get("title", article_title))
                 slug = base_slug
                 counter = 1
-                while news_collection.find_one({"slug": slug}):
+                while col.find_one({"slug": slug}):
                     slug = f"{base_slug}-{counter}"
                     counter += 1
 
@@ -169,33 +207,52 @@ def run_news_scraper() -> dict:
                     "word_count": extracted.get("word_count", 0),
                 }
 
-                news_collection.insert_one(doc)
-                saved += 1
+                col.insert_one(doc)
+                articles_saved += 1
+                logger.info(f"[Scraper] Saved: '{doc['title'][:50]}...' -> /news/{slug}")
 
         scraper_stats["last_scrape_success"] = True
     except Exception as e:
-        logger.error(f"[Scraper] Unhandled error during scraper loop: {e}")
+        logger.error(f"[Scraper] Unhandled error: {e}")
         scraper_stats["last_scrape_success"] = False
     finally:
         end_iso = datetime.now(timezone.utc).isoformat()
         scraper_stats["last_scrape_finished"] = end_iso
-        scraper_stats["articles_discovered"] = discovered
-        scraper_stats["articles_saved"] = saved
-        scraper_stats["articles_skipped"] = skipped
+        scraper_stats["feeds_seen"] = feeds_seen
+        scraper_stats["rss_entries_seen"] = rss_entries_seen
+        scraper_stats["new_candidates"] = new_candidates
+        scraper_stats["duplicates"] = duplicates
+        scraper_stats["extraction_success"] = extraction_success
+        scraper_stats["extraction_failed"] = extraction_failed
+        scraper_stats["ai_success"] = ai_success
+        scraper_stats["ai_failed"] = ai_failed
+        scraper_stats["articles_saved"] = articles_saved
+        scraper_stats["articles_skipped"] = articles_skipped
         scrape_lock.release()
-        logger.info(f"[Scraper] Finished: Discovered={discovered}, Saved={saved}, Skipped={skipped}")
+
+        logger.info(f"[Scraper] Finished | Feeds={feeds_seen} | RSS Entries={rss_entries_seen} | Candidates={new_candidates} | Duplicates={duplicates} | Saved={articles_saved} | Skipped={articles_skipped}")
 
     return {
-        "status": "success" if scraper_stats["last_scrape_success"] else "error",
-        "discovered": discovered,
-        "saved": saved,
-        "skipped": skipped,
+        "status": "completed" if scraper_stats["last_scrape_success"] else "error",
+        "feeds": feeds_seen,
+        "entries": rss_entries_seen,
+        "new": new_candidates,
+        "duplicates": duplicates,
+        "saved": articles_saved,
+        "skipped": articles_skipped,
     }
 
 def background_scraper_loop():
+    # Initial immediate ingestion run on startup
+    time.sleep(3)
+    try:
+        run_news_scraper()
+    except Exception as e:
+        logger.error(f"[Scheduler] Initial scrape failed: {e}")
+
     while True:
+        time.sleep(config.SCRAPER_INTERVAL_SECONDS)
         try:
             run_news_scraper()
         except Exception as e:
-            logger.error(f"[Scheduler] Loop exception: {e}")
-        time.sleep(config.SCRAPER_INTERVAL_SECONDS)
+            logger.error(f"[Scheduler] Recurring scrape failed: {e}")
