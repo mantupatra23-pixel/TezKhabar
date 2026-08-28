@@ -4,7 +4,7 @@ import json
 import socket
 import ipaddress
 import urllib.parse
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 import requests
 from bs4 import BeautifulSoup
 import config
@@ -76,6 +76,18 @@ def is_safe_url(url: str) -> bool:
     except Exception:
         return False
 
+def clean_source_url(url: str) -> str:
+    try:
+        parsed = urllib.parse.urlparse(url)
+        clean_qs = []
+        for k, v in urllib.parse.parse_qsl(parsed.query):
+            if not k.startswith("utm_") and k not in ("fbclid", "gclid", "ref", "oc"):
+                clean_qs.append((k, v))
+        new_query = urllib.parse.urlencode(clean_qs)
+        return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, ""))
+    except Exception:
+        return url
+
 def strip_html_tags(raw_html: str = "") -> str:
     if not raw_html:
         return ""
@@ -94,9 +106,6 @@ def is_valid_news_title(title: str) -> bool:
     return True
 
 def resolve_publisher_url(source_url: str) -> str:
-    """
-    Follows Google News wrapper redirects to uncover the real publisher URL.
-    """
     if "news.google.com" not in source_url:
         return source_url
     if not is_safe_url(source_url):
@@ -110,7 +119,6 @@ def resolve_publisher_url(source_url: str) -> str:
         if "news.google.com" not in final_url:
             return final_url
 
-        # Check page source for canonical or direct publisher redirects
         soup = BeautifulSoup(resp.content, "html.parser")
         canonical = soup.find("link", rel="canonical")
         if canonical and canonical.get("href") and "news.google.com" not in canonical["href"]:
@@ -126,14 +134,9 @@ def resolve_publisher_url(source_url: str) -> str:
         return source_url
 
 def validate_and_normalize_image(image_url: Optional[str], base_url: str = "") -> Optional[str]:
-    """
-    Validates image via HTTP HEAD/GET, checking Content-Type and dimensions.
-    Rejects generic Google News icons, tracking pixels, and broken links.
-    """
     if not image_url or not isinstance(image_url, str):
         return None
 
-    # Resolve relative & protocol-relative URLs
     clean_url = urllib.parse.urljoin(base_url, image_url.strip())
     if clean_url.startswith("//"):
         clean_url = "https:" + clean_url
@@ -152,7 +155,7 @@ def validate_and_normalize_image(image_url: Optional[str], base_url: str = "") -
             ct = resp.headers.get("Content-Type", "").lower()
             if ct.startswith("image/") and "svg" not in ct:
                 cl = resp.headers.get("Content-Length")
-                if cl and int(cl) < 1500:  # Ignore 1x1 tracking pixels
+                if cl and int(cl) < 1500:
                     return None
                 return resp.url
     except Exception:
@@ -175,9 +178,6 @@ def extract_json_ld(soup: BeautifulSoup) -> Dict[str, Any]:
     return {}
 
 def extract_article(target_url: str, fallback_title: str = "", fallback_summary: str = "") -> Dict[str, Any]:
-    """
-    Fetches real publisher article, extracts JSON-LD, OpenGraph, Twitter, and sanitized content.
-    """
     real_url = resolve_publisher_url(target_url)
     domain = urllib.parse.urlparse(real_url).netloc.replace("www.", "")
 
@@ -192,7 +192,6 @@ def extract_article(target_url: str, fallback_title: str = "", fallback_summary:
         soup = BeautifulSoup(resp.content, "html.parser")
         json_ld = extract_json_ld(soup)
 
-        # 1. Title Extraction Priority: og:title -> json_ld headline -> title tag -> fallback
         og_title = soup.find("meta", property="og:title")
         tw_title = soup.find("meta", {"name": "twitter:title"})
         title_tag = soup.title.string.strip() if soup.title and soup.title.string else ""
@@ -218,7 +217,6 @@ def extract_article(target_url: str, fallback_title: str = "", fallback_summary:
         if not is_valid_news_title(extracted_title):
             return {"success": False, "error": "INVALID_ARTICLE_TITLE"}
 
-        # 2. Publisher / Source Name Priority: JSON-LD publisher -> og:site_name -> Domain Name
         publisher_name = ""
         if isinstance(json_ld.get("publisher"), dict) and json_ld["publisher"].get("name"):
             publisher_name = str(json_ld["publisher"]["name"]).strip()
@@ -228,7 +226,6 @@ def extract_article(target_url: str, fallback_title: str = "", fallback_summary:
         if not publisher_name or publisher_name.lower() in FORBIDDEN_TITLES:
             publisher_name = domain.split(".")[0].upper() if domain else "TezKhabar Wire"
 
-        # 3. Image Extraction Priority: JSON-LD image -> og:image -> twitter:image -> article img
         extracted_img = None
         if json_ld.get("image"):
             img_val = json_ld["image"]
@@ -258,7 +255,6 @@ def extract_article(target_url: str, fallback_title: str = "", fallback_summary:
 
         valid_image_url = validate_and_normalize_image(extracted_img, base_url=real_url)
 
-        # 4. Description / Summary
         og_desc = soup.find("meta", property="og:description")
         meta_desc = soup.find("meta", {"name": "description"})
         extracted_desc = ""
@@ -273,7 +269,6 @@ def extract_article(target_url: str, fallback_title: str = "", fallback_summary:
 
         extracted_desc = strip_html_tags(extracted_desc)
 
-        # 5. Clean Article Body
         for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form", "iframe", "noscript", "svg"]):
             tag.decompose()
 
@@ -291,7 +286,6 @@ def extract_article(target_url: str, fallback_title: str = "", fallback_summary:
         if len(body_text.split()) < 15:
             return {"success": False, "error": "CONTENT_INSUFFICIENT"}
 
-        # 6. Dates
         meta_pub = soup.find("meta", property="article:published_time") or soup.find("meta", {"name": "pubdate"})
         published_at = None
         if json_ld.get("datePublished"):
